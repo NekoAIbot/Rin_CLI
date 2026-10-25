@@ -1,0 +1,14 @@
+{
+  "name": "rin-cli",
+  "version": "0.1.0",
+  "description": "Rin, as an agentic coding CLI — same brain, same memory, terminal front-end.",
+  "main": "src/cli.js",
+  "bin": {
+    "rin": "./src/cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

@@ -1,0 +1,5 @@
+node_modules/
+.env
+.rin-cli.env
+*.log
+schema_dump.json
