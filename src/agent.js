@@ -171,7 +171,16 @@ ${TOOL_DESCRIPTIONS}`;
     }
 
     onEvent("action", { action: parsed.action, args: parsed.args });
-    const result = await dispatch(sandboxDir, cfg, parsed.action, parsed.args || {});
+    let result;
+    try {
+      result = await dispatch(sandboxDir, cfg, parsed.action, parsed.args || {});
+    } catch (err) {
+      // A tool failing (e.g. "remember" with no Supabase configured) should
+      // go back to the model as a result to reason about, not crash the
+      // whole process — this is what lets the CLI run fine with zero memory
+      // setup at all, for anyone who just wants the plain coding agent.
+      result = { ok: false, output: `Tool error: ${err.message}` };
+    }
     onEvent("result", result);
 
     history.push({
