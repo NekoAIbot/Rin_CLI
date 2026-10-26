@@ -4,8 +4,36 @@
 // Together AI, etc.) means adding one more entry to PROVIDERS below — nothing else
 // in the CLI has to change.
 
-async function callGemini(messages, { apiKey, model = "gemini-2.0-flash" }) {
+// Gemini renames/retires model ids more often than the code gets updated, so
+// rather than hardcode one and have it 404 again later, ask Gemini itself
+// what's currently available and pick a "flash" tier model, caching for the
+// life of this process.
+let _cachedGeminiModel = null;
+async function resolveGeminiModel(apiKey) {
+  if (_cachedGeminiModel) return _cachedGeminiModel;
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
+  );
+  if (!res.ok) {
+    // If discovery itself fails, fall back to a reasonable guess rather than
+    // hard-erroring before we've even tried a real call.
+    return "gemini-flash-latest";
+  }
+  const data = await res.json();
+  const candidates = (data.models || []).filter(
+    (m) =>
+      m.supportedGenerationMethods?.includes("generateContent") &&
+      /flash/i.test(m.name) &&
+      !/vision|embed/i.test(m.name)
+  );
+  const picked = candidates[0]?.name?.replace("models/", "") || "gemini-flash-latest";
+  _cachedGeminiModel = picked;
+  return picked;
+}
+
+async function callGemini(messages, { apiKey, model }) {
   if (!apiKey) throw new Error("GEMINI_API_KEY not set");
+  if (!model) model = await resolveGeminiModel(apiKey);
   // Gemini wants a different message shape: system prompt separate, turns as
   // {role: "user"|"model", parts: [{text}]}
   const sys = messages.find((m) => m.role === "system");
@@ -66,6 +94,30 @@ async function callOpenAIStyle(messages, { apiKey, model, baseUrl, label }) {
 // Registry of everything the CLI knows how to talk to. `tier: "free"` ones are
 // what the automatic fallback chain uses; `tier: "paid"` ones only run when
 // explicitly chosen via /model, since they cost real money per token.
+// Same problem as Gemini's model id: OpenRouter's free-tier slugs rotate as
+// models get moved to paid-only, so ask OpenRouter live which ones are
+// actually free right now (pricing.prompt === "0") instead of hardcoding one.
+let _cachedFreeOpenRouterModel = null;
+async function resolveFreeOpenRouterModel(apiKey) {
+  if (_cachedFreeOpenRouterModel) return _cachedFreeOpenRouterModel;
+  if (!apiKey) throw new Error("OpenRouter API key not set");
+  const res = await fetch("https://openrouter.ai/api/v1/models", {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  if (!res.ok) throw new Error(`OpenRouter model list failed: ${res.status}`);
+  const data = await res.json();
+  const free = (data.data || []).filter(
+    (m) => m.pricing?.prompt === "0" && m.pricing?.completion === "0"
+  );
+  if (!free.length) throw new Error("No free OpenRouter models currently available");
+  // Prefer a reasonably capable, well-known family if present; otherwise take
+  // whatever's first.
+  const preferred =
+    free.find((m) => /llama|mistral|gemini|qwen/i.test(m.id)) || free[0];
+  _cachedFreeOpenRouterModel = preferred.id;
+  return preferred.id;
+}
+
 const PROVIDERS = {
   gemini: {
     label: "Gemini",
@@ -86,13 +138,15 @@ const PROVIDERS = {
   openrouter: {
     label: "OpenRouter (free pool)",
     tier: "free",
-    run: (messages, cfg) =>
-      callOpenAIStyle(messages, {
+    run: async (messages, cfg) => {
+      const model = await resolveFreeOpenRouterModel(cfg.openrouterApiKey);
+      return callOpenAIStyle(messages, {
         apiKey: cfg.openrouterApiKey,
-        model: "meta-llama/llama-3.3-70b-instruct:free",
+        model,
         baseUrl: "https://openrouter.ai/api/v1",
         label: "OpenRouter",
-      }),
+      });
+    },
   },
   "claude-opus": {
     label: "Claude Opus (via OpenRouter, paid)",
