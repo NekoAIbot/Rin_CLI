@@ -9,14 +9,17 @@
 // what's currently available and pick a "flash" tier model, caching for the
 // life of this process.
 let _cachedGeminiModel = null;
+const _geminiBlacklist = new Set();
+function extractVersion(name) {
+  const m = name.match(/(\d+(?:\.\d+)?)/);
+  return m ? parseFloat(m[1]) : 0;
+}
 async function resolveGeminiModel(apiKey) {
-  if (_cachedGeminiModel) return _cachedGeminiModel;
+  if (_cachedGeminiModel && !_geminiBlacklist.has(_cachedGeminiModel)) return _cachedGeminiModel;
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
   );
   if (!res.ok) {
-    // If discovery itself fails, fall back to a reasonable guess rather than
-    // hard-erroring before we've even tried a real call.
     return "gemini-flash-latest";
   }
   const data = await res.json();
@@ -24,14 +27,20 @@ async function resolveGeminiModel(apiKey) {
     (m) =>
       m.supportedGenerationMethods?.includes("generateContent") &&
       /flash/i.test(m.name) &&
-      !/vision|embed/i.test(m.name)
+      !/vision|embed|preview|exp/i.test(m.name) &&
+      !_geminiBlacklist.has(m.name.replace("models/", ""))
   );
+  // Google's own model list can still include retired-for-new-accounts
+  // entries alongside current ones — sort for the highest version number
+  // rather than trusting list order, since "first in the list" kept landing
+  // on deprecated ones.
+  candidates.sort((a, b) => extractVersion(b.name) - extractVersion(a.name));
   const picked = candidates[0]?.name?.replace("models/", "") || "gemini-flash-latest";
   _cachedGeminiModel = picked;
   return picked;
 }
 
-async function callGemini(messages, { apiKey, model }) {
+async function callGemini(messages, { apiKey, model }, _retrying = false) {
   if (!apiKey) throw new Error("GEMINI_API_KEY not set");
   if (!model) model = await resolveGeminiModel(apiKey);
   // Gemini wants a different message shape: system prompt separate, turns as
@@ -57,6 +66,12 @@ async function callGemini(messages, { apiKey, model }) {
   });
   if (!res.ok) {
     const t = await res.text();
+    if (res.status === 404 && !_retrying) {
+      // This specific model turned out to be retired despite passing
+      // discovery — blacklist it and try the next-best candidate once.
+      _geminiBlacklist.add(model);
+      return callGemini(messages, { apiKey }, true);
+    }
     throw new Error(`Gemini ${res.status}: ${t.slice(0, 300)}`);
   }
   const data = await res.json();
@@ -118,6 +133,28 @@ async function resolveFreeOpenRouterModel(apiKey) {
   return preferred.id;
 }
 
+// Same deal as Gemini/OpenRouter — Groq retires/renames model ids too
+// (llama-3.3-70b-versatile stopped existing between when this was written
+// and when it was actually run). Ask Groq live instead of hardcoding.
+let _cachedGroqModel = null;
+async function resolveGroqModel(apiKey) {
+  if (_cachedGroqModel) return _cachedGroqModel;
+  if (!apiKey) throw new Error("Groq API key not set");
+  const res = await fetch("https://api.groq.com/openai/v1/models", {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  if (!res.ok) throw new Error(`Groq model list failed: ${res.status}`);
+  const data = await res.json();
+  const models = data.data || [];
+  const preferred =
+    models.find((m) => /70b|versatile/i.test(m.id)) ||
+    models.find((m) => /8b|instant/i.test(m.id)) ||
+    models[0];
+  if (!preferred) throw new Error("No Groq models available");
+  _cachedGroqModel = preferred.id;
+  return preferred.id;
+}
+
 const PROVIDERS = {
   gemini: {
     label: "Gemini",
@@ -127,13 +164,15 @@ const PROVIDERS = {
   groq: {
     label: "Groq",
     tier: "free",
-    run: (messages, cfg) =>
-      callOpenAIStyle(messages, {
+    run: async (messages, cfg) => {
+      const model = await resolveGroqModel(cfg.groqApiKey);
+      return callOpenAIStyle(messages, {
         apiKey: cfg.groqApiKey,
-        model: "llama-3.3-70b-versatile",
+        model,
         baseUrl: "https://api.groq.com/openai/v1",
         label: "Groq",
-      }),
+      });
+    },
   },
   openrouter: {
     label: "OpenRouter (free pool)",
