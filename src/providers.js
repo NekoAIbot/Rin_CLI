@@ -268,6 +268,45 @@ const PROVIDERS = {
       });
     },
   },
+  nvidia: {
+    // No credit card, 40 req/min, NO daily cap — verified against
+    // freellm.net before adding. This is the best "almost unlimited free"
+    // option in the chain, so it's placed early in the fallback order.
+    label: "NVIDIA NIM",
+    tier: "free",
+    run: (messages, cfg) =>
+      callOpenAIStyle(messages, {
+        apiKey: cfg.nvidiaApiKey,
+        model: "meta/llama-3.3-70b-instruct",
+        baseUrl: "https://integrate.api.nvidia.com/v1",
+        label: "NVIDIA NIM",
+      }),
+  },
+  mistral: {
+    label: "Mistral AI",
+    tier: "free",
+    run: (messages, cfg) =>
+      callOpenAIStyle(messages, {
+        apiKey: cfg.mistralApiKey,
+        model: "mistral-small-latest",
+        baseUrl: "https://api.mistral.ai/v1",
+        label: "Mistral",
+      }),
+  },
+  nous: {
+    // Real and OpenAI-compatible, but may require card verification at
+    // signup and starts with $5 in credits rather than being unlimited — so
+    // this is selectable via /model, not silently in the automatic chain.
+    label: "Nous Portal (Hermes 3 70B — may need signup/card verification)",
+    tier: "free",
+    run: (messages, cfg) =>
+      callOpenAIStyle(messages, {
+        apiKey: cfg.nousApiKey,
+        model: "Hermes-3-Llama-3.1-70B",
+        baseUrl: "https://inference-api.nousresearch.com/v1",
+        label: "Nous Portal",
+      }),
+  },
   "claude-opus": {
     label: "Claude Opus (via OpenRouter, paid)",
     tier: "paid",
@@ -292,29 +331,44 @@ const PROVIDERS = {
   },
 };
 
-const FALLBACK_ORDER = ["gemini", "groq", "openrouter"];
+// NVIDIA NIM goes right after the two fastest/most reliable ones since it has
+// no daily cap at all (just a 40 req/min ceiling) — OpenRouter moves to last
+// since its free pool has a hard 50-requests/day wall we've already hit once.
+// Nous isn't in the auto chain (signup friction), so /model nous is required.
+const FALLBACK_ORDER = ["gemini", "groq", "nvidia", "mistral", "openrouter"];
 
-// chat(): if `preferredModel` is set (via /model), use only that one.
-// Otherwise walk the free fallback chain until one succeeds.
+// chat(): three ways to call it —
+//   preferredModel is a string   -> use exactly that one provider (explicit /model choice)
+//   preferredModel is an array   -> walk that specific ordered chain until one succeeds
+//                                    (this is how the Planner/Executor role chains work —
+//                                    see cfg.plannerModels / cfg.executorModels in agent.js)
+//   preferredModel is omitted    -> walk the default free fallback chain
 async function chat(messages, cfg, preferredModel) {
   const t0 = Date.now();
-  if (preferredModel) {
+
+  if (typeof preferredModel === "string") {
     const p = PROVIDERS[preferredModel];
     if (!p) throw new Error(`Unknown model "${preferredModel}". Try /model to see the list.`);
     const text = await p.run(messages, cfg);
     return { text, usedModel: preferredModel, ms: Date.now() - t0 };
   }
 
+  const order = Array.isArray(preferredModel) && preferredModel.length ? preferredModel : FALLBACK_ORDER;
   const errors = [];
-  for (const key of FALLBACK_ORDER) {
+  for (const key of order) {
+    const p = PROVIDERS[key];
+    if (!p) {
+      errors.push(`${key}: unknown model (check RIN_CLI_PLANNER_MODELS / RIN_CLI_EXECUTOR_MODELS)`);
+      continue;
+    }
     try {
-      const text = await PROVIDERS[key].run(messages, cfg);
+      const text = await p.run(messages, cfg);
       return { text, usedModel: key, ms: Date.now() - t0 };
     } catch (err) {
       errors.push(`${key}: ${err.message}`);
     }
   }
-  throw new Error("All free providers failed:\n" + errors.join("\n"));
+  throw new Error(`All providers in chain [${order.join(", ")}] failed:\n` + errors.join("\n"));
 }
 
 function listModels() {

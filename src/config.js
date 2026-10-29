@@ -54,10 +54,39 @@ function loadConfig(cwd) {
     geminiApiKey: merged.GEMINI_API_KEY,
     groqApiKey: merged.GROQ_API_KEY,
     openrouterApiKey: merged.OPENROUTER_API_KEY,
+    nvidiaApiKey: merged.NVIDIA_API_KEY,
+    mistralApiKey: merged.MISTRAL_API_KEY,
+    nousApiKey: merged.NOUS_API_KEY,
 
     defaultModel: merged.RIN_CLI_DEFAULT_MODEL || "gemini",
     maxSteps: parseInt(merged.RIN_CLI_MAX_STEPS || "150", 10),
+
+    // Planner/Executor split (used in "auto" mode — i.e. whenever /model
+    // hasn't pinned a single explicit model). The Planner breaks the goal
+    // into one precise, single-file instruction at a time and reviews the
+    // result; the Executor only ever writes/edits the one file it was told
+    // to. Each is its own ordered fallback chain so either side can keep
+    // working through the other's rate limits. Override with a
+    // comma-separated list in ~/.rin-cli.env, e.g.
+    //   RIN_CLI_PLANNER_MODELS=gemini,groq
+    //   RIN_CLI_EXECUTOR_MODELS=groq,nvidia,mistral,openrouter
+    plannerModels: splitModelList(merged.RIN_CLI_PLANNER_MODELS, ["gemini"]),
+    executorModels: splitModelList(merged.RIN_CLI_EXECUTOR_MODELS, [
+      "groq",
+      "nvidia",
+      "mistral",
+      "openrouter",
+    ]),
   };
+}
+
+function splitModelList(raw, fallback) {
+  if (!raw) return fallback;
+  const list = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list.length ? list : fallback;
 }
 
 module.exports = { loadConfig, parseEnvFile };

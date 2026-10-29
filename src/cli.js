@@ -163,6 +163,7 @@ async function main() {
         onEvent,
         initialHistory: result.history,
         initialSteps: result.steps,
+        initialReadState: result.readState,
         humanAnswer: answer,
       });
     }
