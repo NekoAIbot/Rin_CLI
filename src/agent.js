@@ -135,9 +135,10 @@ ${TOOL_DESCRIPTIONS}`;
 
     let raw;
     try {
+      onEvent("thinking_start");
       const result = await chat(history, cfg, model);
       raw = result.text;
-      onEvent("model", { usedModel: result.usedModel });
+      onEvent("model", { usedModel: result.usedModel, ms: result.ms });
     } catch (err) {
       onEvent("error", `LLM call failed: ${err.message}`);
       return { status: "failed", reason: err.message, steps };

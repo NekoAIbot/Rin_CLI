@@ -4,6 +4,49 @@
 // Together AI, etc.) means adding one more entry to PROVIDERS below — nothing else
 // in the CLI has to change.
 
+const fs = require("fs");
+const path = require("path");
+
+// Disk cache for resolved model ids, so a fresh `rin` session doesn't pay the
+// model-discovery round-trip (one extra HTTP call per provider) every single
+// time — this is the single biggest real latency win available, since the
+// discovery calls were adding a full network round-trip before the actual
+// request even started. TTL means a vendor renaming a model again is caught
+// within a few hours, not frozen forever.
+const CACHE_PATH = path.join(
+  process.env.HOME || process.env.PREFIX || "/root",
+  ".rin-cli-model-cache.json"
+);
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+function readDiskCache() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(CACHE_PATH, "utf8"));
+    return raw;
+  } catch {
+    return {};
+  }
+}
+function writeDiskCache(data) {
+  try {
+    fs.writeFileSync(CACHE_PATH, JSON.stringify(data), "utf8");
+  } catch {
+    // Non-fatal — caching is a speed optimization, not a correctness
+    // requirement, so a write failure (e.g. read-only fs) is silently fine.
+  }
+}
+function getCached(key) {
+  const cache = readDiskCache();
+  const entry = cache[key];
+  if (entry && Date.now() - entry.at < CACHE_TTL_MS) return entry.value;
+  return null;
+}
+function setCached(key, value) {
+  const cache = readDiskCache();
+  cache[key] = { value, at: Date.now() };
+  writeDiskCache(cache);
+}
+
 // Gemini renames/retires model ids more often than the code gets updated, so
 // rather than hardcode one and have it 404 again later, ask Gemini itself
 // what's currently available and pick a "flash" tier model, caching for the
@@ -16,6 +59,11 @@ function extractVersion(name) {
 }
 async function resolveGeminiModel(apiKey) {
   if (_cachedGeminiModel && !_geminiBlacklist.has(_cachedGeminiModel)) return _cachedGeminiModel;
+  const disk = getCached("gemini");
+  if (disk && !_geminiBlacklist.has(disk)) {
+    _cachedGeminiModel = disk;
+    return disk;
+  }
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
   );
@@ -37,6 +85,7 @@ async function resolveGeminiModel(apiKey) {
   candidates.sort((a, b) => extractVersion(b.name) - extractVersion(a.name));
   const picked = candidates[0]?.name?.replace("models/", "") || "gemini-flash-latest";
   _cachedGeminiModel = picked;
+  setCached("gemini", picked);
   return picked;
 }
 
@@ -57,6 +106,11 @@ async function callGemini(messages, { apiKey, model }, _retrying = false) {
   const body = {
     contents: turns,
     ...(sys ? { systemInstruction: { parts: [{ text: sys.content }] } } : {}),
+    // Forces strict JSON output instead of relying on the model to follow
+    // formatting instructions on its own — directly fixes the malformed-JSON
+    // retry we actually hit in testing, and saves a full extra round-trip
+    // every time that would otherwise happen.
+    generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
   };
 
   const res = await fetch(url, {
@@ -68,8 +122,15 @@ async function callGemini(messages, { apiKey, model }, _retrying = false) {
     const t = await res.text();
     if (res.status === 404 && !_retrying) {
       // This specific model turned out to be retired despite passing
-      // discovery — blacklist it and try the next-best candidate once.
+      // discovery — blacklist it (and evict it from the disk cache, so a
+      // future session doesn't resurrect the same dead model) and try the
+      // next-best candidate once.
       _geminiBlacklist.add(model);
+      const disk = readDiskCache();
+      if (disk.gemini?.value === model) {
+        delete disk.gemini;
+        writeDiskCache(disk);
+      }
       return callGemini(messages, { apiKey }, true);
     }
     throw new Error(`Gemini ${res.status}: ${t.slice(0, 300)}`);
@@ -82,7 +143,7 @@ async function callGemini(messages, { apiKey, model }, _retrying = false) {
 
 // Groq and OpenRouter both speak the OpenAI chat-completions shape, so one
 // function handles both — just a different base URL / key / default model.
-async function callOpenAIStyle(messages, { apiKey, model, baseUrl, label }) {
+async function callOpenAIStyle(messages, { apiKey, model, baseUrl, label }, _noJsonMode = false) {
   if (!apiKey) throw new Error(`${label} API key not set`);
   const res = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
@@ -93,11 +154,19 @@ async function callOpenAIStyle(messages, { apiKey, model, baseUrl, label }) {
     body: JSON.stringify({
       model,
       messages: messages.map((m) => ({ role: m.role, content: m.content })),
-      temperature: 0.4,
+      temperature: 0.3,
+      // Most OpenAI-compatible backends honor this and stop the model
+      // wrapping JSON in prose/markdown fences — but not every free/open
+      // model behind Groq or OpenRouter supports it, so on a 400 we retry
+      // once without it rather than hard-failing a model that's otherwise fine.
+      ...(_noJsonMode ? {} : { response_format: { type: "json_object" } }),
     }),
   });
   if (!res.ok) {
     const t = await res.text();
+    if (res.status === 400 && !_noJsonMode) {
+      return callOpenAIStyle(messages, { apiKey, model, baseUrl, label }, true);
+    }
     throw new Error(`${label} ${res.status}: ${t.slice(0, 300)}`);
   }
   const data = await res.json();
@@ -115,6 +184,11 @@ async function callOpenAIStyle(messages, { apiKey, model, baseUrl, label }) {
 let _cachedFreeOpenRouterModel = null;
 async function resolveFreeOpenRouterModel(apiKey) {
   if (_cachedFreeOpenRouterModel) return _cachedFreeOpenRouterModel;
+  const disk = getCached("openrouter");
+  if (disk) {
+    _cachedFreeOpenRouterModel = disk;
+    return disk;
+  }
   if (!apiKey) throw new Error("OpenRouter API key not set");
   const res = await fetch("https://openrouter.ai/api/v1/models", {
     headers: { Authorization: `Bearer ${apiKey}` },
@@ -130,6 +204,7 @@ async function resolveFreeOpenRouterModel(apiKey) {
   const preferred =
     free.find((m) => /llama|mistral|gemini|qwen/i.test(m.id)) || free[0];
   _cachedFreeOpenRouterModel = preferred.id;
+  setCached("openrouter", preferred.id);
   return preferred.id;
 }
 
@@ -139,6 +214,11 @@ async function resolveFreeOpenRouterModel(apiKey) {
 let _cachedGroqModel = null;
 async function resolveGroqModel(apiKey) {
   if (_cachedGroqModel) return _cachedGroqModel;
+  const disk = getCached("groq");
+  if (disk) {
+    _cachedGroqModel = disk;
+    return disk;
+  }
   if (!apiKey) throw new Error("Groq API key not set");
   const res = await fetch("https://api.groq.com/openai/v1/models", {
     headers: { Authorization: `Bearer ${apiKey}` },
@@ -152,6 +232,7 @@ async function resolveGroqModel(apiKey) {
     models[0];
   if (!preferred) throw new Error("No Groq models available");
   _cachedGroqModel = preferred.id;
+  setCached("groq", preferred.id);
   return preferred.id;
 }
 
@@ -216,17 +297,19 @@ const FALLBACK_ORDER = ["gemini", "groq", "openrouter"];
 // chat(): if `preferredModel` is set (via /model), use only that one.
 // Otherwise walk the free fallback chain until one succeeds.
 async function chat(messages, cfg, preferredModel) {
+  const t0 = Date.now();
   if (preferredModel) {
     const p = PROVIDERS[preferredModel];
     if (!p) throw new Error(`Unknown model "${preferredModel}". Try /model to see the list.`);
-    return { text: await p.run(messages, cfg), usedModel: preferredModel };
+    const text = await p.run(messages, cfg);
+    return { text, usedModel: preferredModel, ms: Date.now() - t0 };
   }
 
   const errors = [];
   for (const key of FALLBACK_ORDER) {
     try {
       const text = await PROVIDERS[key].run(messages, cfg);
-      return { text, usedModel: key };
+      return { text, usedModel: key, ms: Date.now() - t0 };
     } catch (err) {
       errors.push(`${key}: ${err.message}`);
     }
