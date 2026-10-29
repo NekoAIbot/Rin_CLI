@@ -54,6 +54,23 @@ function runShell(sandboxDir, command, { timeoutMs = 60000 } = {}) {
 function readFile(sandboxDir, relPath) {
   const p = resolveInSandbox(sandboxDir, relPath);
   if (!fs.existsSync(p)) return { ok: false, output: `No such file: ${relPath}` };
+  if (fs.statSync(p).isDirectory()) {
+    // Models sometimes try to read_file a directory (e.g. ".") instead of
+    // using run_shell("ls") — surface this as a normal tool error instead of
+    // letting fs.readFileSync throw EISDIR and crash the step.
+    let listing = "";
+    try {
+      listing = fs.readdirSync(p).join("\n");
+    } catch {
+      // ignore — fall through to the plain message below
+    }
+    return {
+      ok: false,
+      output: `"${relPath}" is a directory, not a file — read_file only works on files. Use run_shell("ls -la ${relPath}") to list a directory instead.${
+        listing ? `\nContents:\n${listing}` : ""
+      }`,
+    };
+  }
   return { ok: true, output: fs.readFileSync(p, "utf8") };
 }
 

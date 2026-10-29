@@ -337,6 +337,39 @@ const PROVIDERS = {
 // Nous isn't in the auto chain (signup friction), so /model nous is required.
 const FALLBACK_ORDER = ["gemini", "groq", "nvidia", "mistral", "openrouter"];
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Node's fetch throws a bare "fetch failed" for a network-level failure — the
+// request never reached the server at all. That is different from a provider
+// responding with an HTTP error (429, 503, etc.), which means the network is
+// fine. On Termux in particular, Android can quietly suspend network access
+// for a backgrounded app for a few seconds even with termux-wake-lock held
+// (that only keeps the CPU awake, not the radio/socket) — so a "fetch
+// failed" is usually a transient blip worth retrying briefly, rather than a
+// real reason to give up on that provider.
+function isTransientNetworkError(err) {
+  return /fetch failed/i.test(err.message);
+}
+
+async function runWithRetry(fn, { retries = 2, delayMs = 1500 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries && isTransientNetworkError(err)) {
+        await sleep(delayMs);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
 // chat(): three ways to call it —
 //   preferredModel is a string   -> use exactly that one provider (explicit /model choice)
 //   preferredModel is an array   -> walk that specific ordered chain until one succeeds
@@ -349,7 +382,7 @@ async function chat(messages, cfg, preferredModel) {
   if (typeof preferredModel === "string") {
     const p = PROVIDERS[preferredModel];
     if (!p) throw new Error(`Unknown model "${preferredModel}". Try /model to see the list.`);
-    const text = await p.run(messages, cfg);
+    const text = await runWithRetry(() => p.run(messages, cfg));
     return { text, usedModel: preferredModel, ms: Date.now() - t0 };
   }
 
@@ -362,7 +395,7 @@ async function chat(messages, cfg, preferredModel) {
       continue;
     }
     try {
-      const text = await p.run(messages, cfg);
+      const text = await runWithRetry(() => p.run(messages, cfg));
       return { text, usedModel: key, ms: Date.now() - t0 };
     } catch (err) {
       errors.push(`${key}: ${err.message}`);
