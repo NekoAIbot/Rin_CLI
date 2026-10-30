@@ -145,6 +145,10 @@ async function runSingleModelLoop({
   initialSteps = 0,
   humanAnswer,
   readState,
+  onCheckpoint, // optional (history, steps, readState) => void — called after
+  // every completed step, so a session can be resumed from the last
+  // completed step even if the process was killed mid-run (Termux closed,
+  // connection dropped, etc.) rather than losing all progress.
 }) {
   let history = initialHistory;
   if (!history) {
@@ -211,7 +215,7 @@ ${SINGLE_MODEL_TOOL_DESCRIPTIONS}`;
 
     if (parsed.action === "done") {
       onEvent("done", parsed.args?.summary || "");
-      return { status: "done", summary: parsed.args?.summary, steps };
+      return { status: "done", summary: parsed.args?.summary, steps, readState: [...readState] };
     }
 
     if (parsed.action === "ask_human") {
@@ -235,10 +239,14 @@ ${SINGLE_MODEL_TOOL_DESCRIPTIONS}`;
       role: "user",
       content: `Result of ${parsed.action}:\n${result.output || "(no output)"}`,
     });
+
+    if (onCheckpoint) {
+      onCheckpoint({ mode: "single", model, history, steps, readState: [...readState] });
+    }
   }
 
   onEvent("warn", `Hit the step ceiling (${cfg.maxSteps}) without finishing — stopping as a safety net.`);
-  return { status: "step_limit", steps };
+  return { status: "step_limit", steps, readState: [...readState] };
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +377,7 @@ async function runPlannerExecutorLoop({
   initialSteps = 0,
   humanAnswer,
   readState,
+  onCheckpoint,
 }) {
   let history = initialHistory;
   if (!history) {
@@ -434,7 +443,7 @@ ${PLANNER_TOOL_DESCRIPTIONS}`;
 
     if (parsed.action === "done") {
       onEvent("done", parsed.args?.summary || "");
-      return { status: "done", summary: parsed.args?.summary, steps };
+      return { status: "done", summary: parsed.args?.summary, steps, readState: [...readState] };
     }
 
     if (parsed.action === "ask_human") {
@@ -479,10 +488,14 @@ ${PLANNER_TOOL_DESCRIPTIONS}`;
       role: "user",
       content: `Result of ${parsed.action}:\n${result.output || "(no output)"}`,
     });
+
+    if (onCheckpoint) {
+      onCheckpoint({ mode: "planner_executor", history, steps, readState: [...readState] });
+    }
   }
 
   onEvent("warn", `Hit the step ceiling (${cfg.maxSteps}) without finishing — stopping as a safety net.`);
-  return { status: "step_limit", steps };
+  return { status: "step_limit", steps, readState: [...readState] };
 }
 
 // ---------------------------------------------------------------------------
