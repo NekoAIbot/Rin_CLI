@@ -7,6 +7,8 @@
 // It always filters by user_id itself, explicitly, so it only ever touches
 // your own rows even though the key could technically see everyone's.
 
+const { runWithRetry } = require("./providers");
+
 async function sbFetch(cfg, pathAndQuery, options = {}) {
   if (!cfg.supabaseUrl) throw new Error("SUPABASE_URL not set");
   if (!cfg.supabaseServiceRoleKey)
@@ -14,15 +16,20 @@ async function sbFetch(cfg, pathAndQuery, options = {}) {
       "SUPABASE_SERVICE_ROLE_KEY not set — add it to ~/.rin-cli.env (not the project .env)"
     );
 
-  const res = await fetch(`${cfg.supabaseUrl}/rest/v1/${pathAndQuery}`, {
-    ...options,
-    headers: {
-      apikey: cfg.supabaseServiceRoleKey,
-      Authorization: `Bearer ${cfg.supabaseServiceRoleKey}`,
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-  });
+  // Same transient-network-blip retry as the LLM providers get — a dropped
+  // mobile connection shouldn't silently cost you the whole memory layer for
+  // a run, just because the one fetch that happened to hit it was unlucky.
+  const res = await runWithRetry(() =>
+    fetch(`${cfg.supabaseUrl}/rest/v1/${pathAndQuery}`, {
+      ...options,
+      headers: {
+        apikey: cfg.supabaseServiceRoleKey,
+        Authorization: `Bearer ${cfg.supabaseServiceRoleKey}`,
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+    })
+  );
   if (!res.ok) {
     const t = await res.text();
     throw new Error(`Supabase ${res.status} on ${pathAndQuery}: ${t.slice(0, 300)}`);

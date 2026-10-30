@@ -211,6 +211,15 @@ async function resolveFreeOpenRouterModel(apiKey) {
 // Same deal as Gemini/OpenRouter — Groq retires/renames model ids too
 // (llama-3.3-70b-versatile stopped existing between when this was written
 // and when it was actually run). Ask Groq live instead of hardcoding.
+//
+// The old version here fell through to "just take models[0]" when nothing
+// matched 70b/8b/instant — which is how a coding run ended up actually
+// driven by allam-2-7b, a narrow Arabic-focused instruct model with no
+// business writing Python. GROQ_MODEL_EXCLUDE filters those (and
+// non-chat models like whisper/tts/guard/embed) out before any tier is
+// considered, and a known-good-family tier is tried before giving up and
+// taking whatever's left.
+const GROQ_MODEL_EXCLUDE = /whisper|tts|guard|moderation|embed|allam|prompt-guard/i;
 let _cachedGroqModel = null;
 async function resolveGroqModel(apiKey) {
   if (_cachedGroqModel) return _cachedGroqModel;
@@ -225,15 +234,81 @@ async function resolveGroqModel(apiKey) {
   });
   if (!res.ok) throw new Error(`Groq model list failed: ${res.status}`);
   const data = await res.json();
-  const models = data.data || [];
+  const models = (data.data || []).filter((m) => !GROQ_MODEL_EXCLUDE.test(m.id));
   const preferred =
     models.find((m) => /70b|versatile/i.test(m.id)) ||
+    models.find((m) => /llama|mixtral|gemma|qwen|deepseek/i.test(m.id)) ||
     models.find((m) => /8b|instant/i.test(m.id)) ||
-    models[0];
+    models[0] ||
+    (data.data || [])[0]; // last resort: even an excluded model beats throwing
   if (!preferred) throw new Error("No Groq models available");
   _cachedGroqModel = preferred.id;
   setCached("groq", preferred.id);
   return preferred.id;
+}
+
+// NVIDIA NIM retires model ids outright (not just renames) — the hardcoded
+// meta/llama-3.3-70b-instruct here started hard-404/410ing after its listed
+// end-of-life date, permanently dead-ending that slot in every fallback
+// chain until someone noticed and hand-fixed it. Same cure as Gemini: ask
+// NVIDIA live what's actually servable, and blacklist-and-retry once if the
+// picked model turns out to be gone anyway (belt and suspenders — discovery
+// can still return something retired-for-new-callers).
+const NVIDIA_MODEL_EXCLUDE = /embed|rerank|guard|moderation|whisper|vision|ocr/i;
+let _cachedNvidiaModel = null;
+const _nvidiaBlacklist = new Set();
+async function resolveNvidiaModel(apiKey) {
+  if (_cachedNvidiaModel && !_nvidiaBlacklist.has(_cachedNvidiaModel)) return _cachedNvidiaModel;
+  const disk = getCached("nvidia");
+  if (disk && !_nvidiaBlacklist.has(disk)) {
+    _cachedNvidiaModel = disk;
+    return disk;
+  }
+  if (!apiKey) throw new Error("NVIDIA_API_KEY not set");
+  const res = await fetch("https://integrate.api.nvidia.com/v1/models", {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  if (!res.ok) throw new Error(`NVIDIA NIM model list failed: ${res.status}`);
+  const data = await res.json();
+  const models = (data.data || []).filter(
+    (m) => !NVIDIA_MODEL_EXCLUDE.test(m.id) && !_nvidiaBlacklist.has(m.id)
+  );
+  const preferred =
+    models.find((m) => /llama.*70b.*instruct/i.test(m.id)) ||
+    models.find((m) => /70b.*instruct|instruct.*70b/i.test(m.id)) ||
+    models.find((m) => /llama|mixtral|qwen|nemotron|gemma|deepseek/i.test(m.id)) ||
+    models[0];
+  if (!preferred) throw new Error("No usable NVIDIA NIM models currently available");
+  _cachedNvidiaModel = preferred.id;
+  setCached("nvidia", preferred.id);
+  return preferred.id;
+}
+
+async function callNvidia(messages, cfg, _retrying = false) {
+  const model = await resolveNvidiaModel(cfg.nvidiaApiKey);
+  try {
+    return await callOpenAIStyle(messages, {
+      apiKey: cfg.nvidiaApiKey,
+      model,
+      baseUrl: "https://integrate.api.nvidia.com/v1",
+      label: "NVIDIA NIM",
+    });
+  } catch (err) {
+    if (/NVIDIA NIM (404|410):/.test(err.message) && !_retrying) {
+      // This specific model turned out to be retired/gone despite passing
+      // discovery (or despite the disk cache) — blacklist it, evict it from
+      // disk so a future session doesn't resurrect it, and try the
+      // next-best candidate once.
+      _nvidiaBlacklist.add(model);
+      const disk = readDiskCache();
+      if (disk.nvidia?.value === model) {
+        delete disk.nvidia;
+        writeDiskCache(disk);
+      }
+      return callNvidia(messages, cfg, true);
+    }
+    throw err;
+  }
 }
 
 const PROVIDERS = {
@@ -272,15 +347,12 @@ const PROVIDERS = {
     // No credit card, 40 req/min, NO daily cap — verified against
     // freellm.net before adding. This is the best "almost unlimited free"
     // option in the chain, so it's placed early in the fallback order.
+    // Model id is resolved live (see resolveNvidiaModel above) instead of
+    // hardcoded — the previous hardcoded id reached its end-of-life and
+    // started permanently 410ing.
     label: "NVIDIA NIM",
     tier: "free",
-    run: (messages, cfg) =>
-      callOpenAIStyle(messages, {
-        apiKey: cfg.nvidiaApiKey,
-        model: "meta/llama-3.3-70b-instruct",
-        baseUrl: "https://integrate.api.nvidia.com/v1",
-        label: "NVIDIA NIM",
-      }),
+    run: (messages, cfg) => callNvidia(messages, cfg),
   },
   mistral: {
     label: "Mistral AI",
@@ -341,14 +413,15 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Node's fetch throws a bare "fetch failed" for a network-level failure — the
-// request never reached the server at all. That is different from a provider
-// responding with an HTTP error (429, 503, etc.), which means the network is
-// fine. On Termux in particular, Android can quietly suspend network access
-// for a backgrounded app for a few seconds even with termux-wake-lock held
-// (that only keeps the CPU awake, not the radio/socket) — so a "fetch
-// failed" is usually a transient blip worth retrying briefly, rather than a
-// real reason to give up on that provider.
+// Node's fetch throws a bare "fetch failed" (sometimes with a DNS/ECONNRESET
+// cause attached) for a network-level failure — the request never reached
+// the server at all. That's different from a provider responding with an
+// HTTP error (429, 503, etc.), which means the network is fine. On Termux in
+// particular, Android can quietly suspend network access for a backgrounded
+// app for a few seconds even with termux-wake-lock held (that only keeps the
+// CPU awake, not the radio/socket) — so a "fetch failed" is usually a
+// transient blip worth retrying briefly, rather than a real reason to give
+// up on that provider.
 function isTransientNetworkError(err) {
   return /fetch failed/i.test(err.message);
 }
@@ -412,4 +485,4 @@ function listModels() {
   }));
 }
 
-module.exports = { chat, listModels, PROVIDERS, FALLBACK_ORDER };
+module.exports = { chat, listModels, PROVIDERS, FALLBACK_ORDER, runWithRetry };
