@@ -1,8 +1,6 @@
 // ui.js — everything about how Rin looks. Kept separate from cli.js (which
 // is about what Rin does) so the visual system lives in exactly one place:
-// palette, welcome card, tool-call rendering, section headers, run footer.
-
-const path = require("path");
+// themes, boxes, welcome card, input box, pickers, tool-call rendering.
 
 const C = {
   reset: "\x1b[0m",
@@ -18,13 +16,109 @@ const C = {
   white: "\x1b[97m",
 };
 
+// ── Themes ──────────────────────────────────────────────────────────────────
+// A colour is either [r,g,b] (truecolor) or a raw escape string (16-colour).
 const rgb = (r, g, b) => `\x1b[38;2;${r};${g};${b}m`;
-const VIOLET = rgb(192, 132, 252); // planner / brand
-const AQUA = rgb(34, 211, 238); // executor / prompt
-const AMBER = rgb(250, 204, 21); // needs attention
-const MINT = rgb(74, 222, 128); // success
-const ROSE = rgb(248, 113, 113); // failure
+const col = (x) => (Array.isArray(x) ? rgb(x[0], x[1], x[2]) : x || "");
 
+const THEMES = {
+  rin: {
+    label: "Rin",
+    desc: "violet → aqua",
+    brand: [192, 132, 252],
+    accent: [34, 211, 238],
+    warn: [250, 204, 21],
+    ok: [74, 222, 128],
+    err: [248, 113, 113],
+    text: "\x1b[97m",
+    logo: [[192, 132, 252], [34, 211, 238]],
+  },
+  ocean: {
+    label: "Ocean",
+    desc: "blue → teal",
+    brand: [96, 165, 250],
+    accent: [45, 212, 191],
+    warn: [251, 191, 36],
+    ok: [52, 211, 153],
+    err: [251, 113, 133],
+    text: "\x1b[97m",
+    logo: [[96, 165, 250], [45, 212, 191]],
+  },
+  sunset: {
+    label: "Sunset",
+    desc: "coral → amber",
+    brand: [251, 113, 133],
+    accent: [251, 146, 60],
+    warn: [250, 204, 21],
+    ok: [163, 230, 53],
+    err: [239, 68, 68],
+    text: "\x1b[97m",
+    logo: [[244, 114, 182], [251, 191, 36]],
+  },
+  light: {
+    label: "Light",
+    desc: "for light backgrounds",
+    brand: [109, 40, 217],
+    accent: [14, 116, 144],
+    warn: [180, 83, 9],
+    ok: [21, 128, 61],
+    err: [185, 28, 28],
+    text: "\x1b[39m",
+    logo: [[109, 40, 217], [14, 116, 144]],
+  },
+  mono: {
+    label: "Mono",
+    desc: "no colour, just weight",
+    brand: "",
+    accent: "\x1b[1m",
+    warn: "\x1b[1m",
+    ok: "",
+    err: "\x1b[1m",
+    text: "\x1b[39m",
+    logo: null,
+  },
+  ansi: {
+    label: "ANSI",
+    desc: "16 basic colours, max compatibility",
+    brand: "\x1b[35m",
+    accent: "\x1b[36m",
+    warn: "\x1b[33m",
+    ok: "\x1b[32m",
+    err: "\x1b[31m",
+    text: "\x1b[39m",
+    logo: null,
+  },
+};
+const THEME_ORDER = ["rin", "ocean", "sunset", "light", "mono", "ansi"];
+
+// The live palette. Everything reads T.x at draw time, so switching theme
+// (even mid-picker, for the live preview) restyles the next frame.
+const T = {};
+function setTheme(id) {
+  const th = THEMES[id] || THEMES.rin;
+  T.id = THEMES[id] ? id : "rin";
+  T.brand = col(th.brand);
+  T.accent = col(th.accent);
+  T.warn = col(th.warn);
+  T.ok = col(th.ok);
+  T.err = col(th.err);
+  T.text = col(th.text);
+  T.border = `${C.dim}${T.brand}`;
+  T.borderHi = T.brand;
+  T.logo = th.logo;
+  return T.id;
+}
+setTheme(process.env.NO_COLOR ? "mono" : "rin");
+
+// Behaviour switches from /config (see settings.js).
+const S = { showThoughts: true, toolDetail: "compact", animations: true, hints: true };
+function applySettings(s) {
+  if (!s) return;
+  if (s.theme) setTheme(s.theme);
+  for (const k of Object.keys(S)) if (k in s) S[k] = s[k];
+}
+
+// ── Text helpers ────────────────────────────────────────────────────────────
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const vlen = (s) => s.replace(ANSI_RE, "").length;
 // Leave a 2-column margin: a line exactly as wide as the terminal sits in the
@@ -32,12 +126,10 @@ const vlen = (s) => s.replace(ANSI_RE, "").length;
 // soft-wrapped line — that's what glued box edges and the prompt together.
 const termWidth = () => Math.min(Math.max((process.stdout.columns || 62) - 2, 24), 72);
 
-// Inline markdown-lite for text the model writes (summaries, thoughts):
-// **bold** and `code`. Applied per wrapped line, so a marker pair split
-// across a line break simply stays literal instead of corrupting colors.
+// Inline markdown-lite for text the model writes: **bold** and `code`.
 function md(line) {
   return String(line)
-    .replace(/`([^`]+)`/g, `${AQUA}$1${C.reset}`)
+    .replace(/`([^`]+)`/g, `${T.accent}$1${C.reset}`)
     .replace(/\*\*([^*]+)\*\*/g, `${C.bold}$1${C.reset}`);
 }
 
@@ -65,7 +157,9 @@ function fmtAgo(iso) {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+// Gradient across a string; themes without a gradient get a solid brand colour.
 function gradientText(text, from, to) {
+  if (!Array.isArray(from) || !Array.isArray(to)) return `${C.bold}${T.brand}${text}${C.reset}`;
   const n = text.length;
   let out = "";
   for (let i = 0; i < n; i++) {
@@ -77,8 +171,8 @@ function gradientText(text, from, to) {
   }
   return out + C.reset;
 }
+const brandGradient = (text) => (T.logo ? gradientText(text, T.logo[0], T.logo[1]) : `${C.bold}${T.brand}${text}${C.reset}`);
 
-// Plain-text helpers (operate BEFORE styling so widths stay exact).
 function fit(text, max) {
   text = String(text);
   return text.length <= max ? text : text.slice(0, Math.max(0, max - 1)) + "…";
@@ -119,7 +213,7 @@ function rule() {
 }
 
 function sectionHeader(title) {
-  console.log(`\n${C.bold}${C.white}${title}${C.reset}`);
+  console.log(`\n${C.bold}${T.text}${title}${C.reset}`);
   console.log(`${C.dim}${"─".repeat(Math.min(termWidth(), 56))}${C.reset}`);
 }
 
@@ -145,50 +239,72 @@ function clipAnsi(s, max) {
   return out + "…" + C.reset;
 }
 
-function box(lines, width) {
+// ── Boxes ───────────────────────────────────────────────────────────────────
+// Every returned line is exactly `width` visible columns, so the right edge
+// always lines up. `lines` are already-styled strings; they get clipped and
+// padded to the inner width (width - 4: border + space on each side).
+function frame(lines, { width = termWidth(), title = "", color = T.border } = {}) {
   const cw = width - 4;
+  const edge = (s) => `${color}${s}${C.reset}`;
   const out = [];
-  out.push(`${C.dim}╭${"─".repeat(width - 2)}╮${C.reset}`);
+  if (title) {
+    const t = clipAnsi(title, Math.max(1, width - 6));
+    const fill = Math.max(0, width - 5 - vlen(t));
+    out.push(`${edge("╭─")} ${t} ${edge("─".repeat(fill) + "╮")}`);
+  } else {
+    out.push(edge("╭" + "─".repeat(width - 2) + "╮"));
+  }
   for (const raw of lines) {
     const line = clipAnsi(raw, cw);
-    const pad = Math.max(0, cw - vlen(line));
-    out.push(`${C.dim}│${C.reset} ${line}${" ".repeat(pad)} ${C.dim}│${C.reset}`);
+    const pad = " ".repeat(Math.max(0, cw - vlen(line)));
+    out.push(`${edge("│")} ${line}${C.reset}${pad} ${edge("│")}`);
   }
-  out.push(`${C.dim}╰${"─".repeat(width - 2)}╯${C.reset}`);
-  return out.join("\n");
+  out.push(edge("╰" + "─".repeat(width - 2) + "╯"));
+  return out;
 }
 
-const PROMPT_GLYPH = `${C.bold}${AQUA}❯${C.reset}`;
-const ASK_GLYPH = `${C.bold}${AMBER}❯${C.reset}`;
+// Kept for older callers/tests: print a plain dim box.
+function box(lines, width) {
+  return frame(lines, { width, color: `${C.dim}` }).join("\n");
+}
 
-// ── The gutter ──────────────────────────────────────────────────────────────
-// Everything Rin does during a run hangs off one continuous vertical bar on
-// the left (the way Antigravity frames agent activity), opened by the input
-// box's bottom edge and closed by the footer's ╰. `emit` turns any line that
-// starts with two spaces into a bar line, so renderers just write indented text.
-const GUT = `${C.dim}${VIOLET}`;
-const BAR = `${GUT}│${C.reset}`;
+// One dim row under a box: hint on the left, mode on the right.
+function hintRow({ left = "", right = "", leftStyle = "", width = termWidth() } = {}) {
+  const avail = width - 2;
+  if (right && right.length + 4 > avail) right = "";
+  if (right && left && left.length + right.length + 2 > avail) right = "";
+  if (left && left.length + (right ? right.length + 2 : 0) > avail) left = fit(left, avail - (right ? right.length + 2 : 0));
+  const gap = Math.max(1, avail - left.length - right.length);
+  const l = left ? `${leftStyle || C.dim}${left}${C.reset}` : "";
+  const r = right ? `${C.dim}${right}${C.reset}` : "";
+  return `  ${l}${" ".repeat(gap)}${r}`;
+}
+
+// ── The run rail ────────────────────────────────────────────────────────────
+// Everything Rin does during a run hangs off one vertical bar on the left,
+// opened under the submitted input box and closed by the footer's ╰.
+// `emit` turns any line starting with two spaces into a bar line, so
+// renderers just write indented text.
+const bar = () => `${T.border}│${C.reset}`;
 
 function emit(s = "") {
   for (const seg of String(s).split("\n")) {
-    if (seg === "") console.log(BAR);
-    else if (seg.startsWith("  ")) console.log(BAR + seg.slice(1));
+    if (seg === "") console.log(bar());
+    else if (seg.startsWith("  ")) console.log(bar() + seg.slice(1));
     else console.log(seg);
   }
 }
 
 function gutterSection(title) {
-  emit(`\n  ${C.bold}${C.white}${title}${C.reset}`);
+  emit(`\n  ${C.bold}${T.text}${title}${C.reset}`);
 }
 
-// Close the bar: ╰ ✓ completed · 7 steps · 42s
 function closeBar(text, ok = true) {
-  console.log(`${GUT}╰${C.reset} ${ok ? MINT : AMBER}${ok ? "✓" : "■"}${C.reset} ${C.dim}${text}${C.reset}`);
+  console.log(`${T.border}╰${C.reset} ${ok ? T.ok : T.warn}${ok ? "✓" : "■"}${C.reset} ${C.dim}${text}${C.reset}`);
 }
 
 // ── The logo ────────────────────────────────────────────────────────────────
-// Original block-letter mark, drawn with half-blocks (3 rows × 17 cols) and
-// painted with a diagonal violet → aqua gradient.
+// Original block-letter mark, drawn with half-blocks (3 rows × 17 cols).
 const LOGO = [
   "█▀▀▀▄  ▀█▀  █▄  █",
   "█▄▄▄▀   █   █ ▀▄█",
@@ -206,102 +322,194 @@ function paintLogo(rows) {
         out += " ";
         continue;
       }
-      const t = Math.min(1, (x / (W - 1)) * 0.75 + (y / (H - 1)) * 0.25);
-      const r = Math.round(192 + (34 - 192) * t);
-      const g = Math.round(132 + (211 - 132) * t);
-      const b = Math.round(252 + (238 - 252) * t);
-      out += `\x1b[38;2;${r};${g};${b}m${ch}`;
+      if (T.logo) {
+        const t = Math.min(1, (x / (W - 1)) * 0.75 + (y / (H - 1)) * 0.25);
+        const [a, b] = T.logo;
+        out += rgb(Math.round(a[0] + (b[0] - a[0]) * t), Math.round(a[1] + (b[1] - a[1]) * t), Math.round(a[2] + (b[2] - a[2]) * t)) + ch;
+      } else {
+        out += T.brand + ch;
+      }
     }
     return `${C.bold}${out}${C.reset}`;
   });
 }
 
-function welcome({ projectDir, mode, sessionCount, lastGoal, memoryConfigured, version, inOwnSource }) {
-  const w = termWidth();
+// ── Welcome card ────────────────────────────────────────────────────────────
+function welcomeLines({ projectDir, mode, sessionCount, lastGoal, memoryConfigured, width = termWidth() }) {
+  const cw = width - 4;
   const logo = paintLogo(LOGO);
-  const side = [
-    `${C.bold}${C.white}Rin${C.reset}${version ? ` ${C.dim}v${version}${C.reset}` : ""}`,
-    `${C.dim}agentic coding in your terminal${C.reset}`,
-    `${C.dim}free-tier models · shared memory${C.reset}`,
-  ];
   const logoW = LOGO[0].length;
-  const wide = w >= logoW + 4 + 32;
+  const side = [`${C.bold}${T.text}agentic coding${C.reset}`, `${C.dim}in your terminal${C.reset}`, `${C.dim}free-tier · shared memory${C.reset}`];
+  const wide = cw >= logoW + 3 + 26;
 
-  console.log();
+  const out = [""];
   if (wide) {
-    for (let i = 0; i < logo.length; i++) console.log(`  ${logo[i]}    ${clipAnsi(side[i], w - logoW - 6)}`);
+    for (let i = 0; i < logo.length; i++) out.push(`${logo[i]}   ${side[i]}`);
   } else {
-    for (const l of logo) console.log(`  ${l}`);
-    for (const s of side) console.log(`  ${clipAnsi(s, w - 2)}`);
+    for (const l of logo) out.push(l);
+    for (const s of side) out.push(s);
   }
+  out.push("");
 
-  const label = (k) => `${C.dim}${k.padEnd(9)}${C.reset}`;
-  const avail = w - 4 - 9;
-  console.log();
-  console.log(`  ${label("cwd")}${shortPath(projectDir, avail)}`);
-  console.log(`  ${label("mode")}${fit(mode, avail)}`);
-  console.log(
-    `  ${label("memory")}${memoryConfigured ? `${MINT}●${C.reset} linked ${C.dim}· /memory${C.reset}` : `${C.dim}○ not configured${C.reset}`}`
+  const label = (k) => `${C.dim}${k.padEnd(8)}${C.reset}`;
+  const avail = cw - 8;
+  out.push(`${label("cwd")}${shortPath(projectDir, avail)}`);
+  out.push(`${label("mode")}${fit(mode, avail)}`);
+  out.push(
+    `${label("memory")}${memoryConfigured ? `${T.ok}●${C.reset} linked ${C.dim}· /memory${C.reset}` : `${C.dim}○ not configured${C.reset}`}`
   );
   if (sessionCount) {
-    console.log(`  ${label("resume")}${AMBER}↳${C.reset} ${fit(lastGoal || "last session", avail - 3)}`);
-    console.log(`  ${label("")}${C.dim}${fit(`${sessionCount} saved · /continue latest · /resume pick`, avail)}${C.reset}`);
+    out.push(`${label("resume")}${T.warn}↳${C.reset} ${fit(lastGoal || "last session", avail - 2)}`);
+    out.push(`${label("")}${C.dim}${fit(`${sessionCount} saved · /continue · /resume`, avail)}${C.reset}`);
   }
+  out.push("");
+  return out;
+}
+
+function welcome({ projectDir, mode, sessionCount, lastGoal, memoryConfigured, version, inOwnSource }) {
+  const w = termWidth();
+  const title = `${C.bold}${T.text}Rin${C.reset}${version ? ` ${C.dim}v${version}${C.reset}` : ""}`;
   console.log();
-  console.log(`  ${C.dim}${fit("/help · !shell · tab completes · ctrl+c twice exits", w - 4)}${C.reset}`);
+  console.log(frame(welcomeLines({ projectDir, mode, sessionCount, lastGoal, memoryConfigured, width: w }), { width: w, title, color: T.border }).join("\n"));
+  console.log(hintRow({ left: "/help · /theme · /config · ctrl+c twice exits", width: w }));
   if (inOwnSource) {
-    console.log(
-      `\n  ${AMBER}⚠${C.reset} ${C.dim}You're inside Rin's own source folder — edits here change the tool itself. cd to a project folder first.${C.reset}`
-    );
+    for (const [i, l] of wrap("⚠ You're inside Rin's own source folder — edits here change the tool itself. cd to a project folder first.", w - 4).entries()) {
+      console.log(`  ${i === 0 ? T.warn : C.dim}${l}${C.reset}`);
+    }
   }
 }
 
 // ── The input box ───────────────────────────────────────────────────────────
-//   ╭─ rin ─────────────────── auto · planner → executor ─
-//   │ ❯ type here…
-//   ╰──────────────────────────────────────────────────────
-// Open on the right on purpose: a fixed right border can't survive typing
-// past the edge, but top + left + bottom always can. The mode sits in the
-// top-right (where Antigravity shows its model name).
-const PROMPT_LINE = `${C.dim}${VIOLET}│${C.reset} ${PROMPT_GLYPH} `;
-
-function inputTop(right) {
-  const w = termWidth();
-  const leftLen = 7; // "╭─ rin "
-  let r = right ? String(right) : "";
-  if (r && w - leftLen - (r.length + 3) < 4) r = "";
-  const fill = Math.max(2, w - leftLen - (r ? r.length + 3 : 0));
-  const tail = r ? ` ${C.dim}${r}${C.reset} ${GUT}─${C.reset}` : "";
-  console.log(
-    `\n${GUT}╭─${C.reset} ${gradientText("rin", [192, 132, 252], [34, 211, 238])} ${GUT}${"─".repeat(fill)}${C.reset}${tail}`
-  );
+//   ╭─ rin ────────────────────────────╮
+//   │ ❯ type here…                     │
+//   ╰──────────────────────────────────╯
+//     / commands · ! shell     auto · planner → executor
+// `texts` are the (plain) visible rows, `firstIndex` the global index of the
+// first one (the glyph only shows on global row 0).
+function inputFrame({ texts, firstIndex = 0, kind = "normal", title = "rin", placeholder = "", width = termWidth() }) {
+  const shell = kind === "shell";
+  const ask = kind === "ask";
+  const glyph = shell ? `${C.bold}${T.warn}!${C.reset}` : ask ? `${C.bold}${T.warn}?${C.reset}` : `${C.bold}${T.accent}❯${C.reset}`;
+  const color = shell || ask ? T.warn : T.borderHi;
+  const ttl = shell ? `${C.bold}${T.warn}shell${C.reset}` : ask ? `${C.bold}${T.warn}${title}${C.reset}` : brandGradient(title);
+  const lines = texts.map((t, i) => {
+    const lead = firstIndex + i === 0 ? `${glyph} ` : "  ";
+    return `${lead}${t}`;
+  });
+  if (!lines.length) lines.push(`${glyph} `);
+  if (placeholder && texts.length === 1 && texts[0] === "" && firstIndex === 0) {
+    lines[0] = `${glyph} ${C.dim}${fit(placeholder, width - 6)}${C.reset}`;
+  }
+  return frame(lines, { width, title: ttl, color });
 }
 
-function inputBottom() {
-  console.log(`${GUT}╰${"─".repeat(termWidth() - 1)}${C.reset}`);
+// Command/argument suggestions shown under the box while typing "/".
+function suggestLines(items, sel, width = termWidth(), maxRows = 7) {
+  const total = items.length;
+  let start = 0;
+  if (total > maxRows) start = Math.min(Math.max(0, sel - Math.floor(maxRows / 2)), total - maxRows);
+  const shown = items.slice(start, start + maxRows);
+  const vw = Math.min(Math.max(...items.map((i) => i.value.length)), Math.floor(width / 2));
+  const out = shown.map((it, k) => {
+    const on = start + k === sel;
+    const v = fit(it.value, vw).padEnd(vw);
+    const d = it.desc ? fit(it.desc, Math.max(0, width - vw - 8)) : "";
+    return on
+      ? `  ${T.brand}${C.bold}❯ ${v}${C.reset}  ${T.text}${d}${C.reset}`
+      : `    ${C.dim}${v}  ${d}${C.reset}`;
+  });
+  if (total > maxRows) out.push(`  ${C.dim}  ${start + shown.length < total ? `↓ ${total - start - shown.length} more` : `↑ ${start} above`} · tab completes${C.reset}`);
+  return out.map((l) => clipAnsi(l, width));
 }
 
+// ── Pickers (the numbered ❯ lists) ──────────────────────────────────────────
+// rows: [{ label, hint?, value?, tag?, current? }]
+//   hint  — dim text on the right      value — right-aligned setting value
+//   tag   — short coloured text before the label (e.g. a session id)
+function menuFrame({ title, intro = [], rows, sel, numbered = true, preview = [], width = termWidth() }) {
+  const cw = width - 4;
+  const body = [];
+  for (const p of intro) for (const l of wrap(p, cw)) body.push(`${C.dim}${l}${C.reset}`);
+  if (intro.length) body.push("");
+
+  const numW = String(rows.length).length;
+  rows.forEach((r, i) => {
+    const on = i === sel;
+    const lead = on ? `${T.brand}${C.bold}❯${C.reset} ` : "  ";
+    const num = numbered ? `${on ? T.brand : C.dim}${String(i + 1).padStart(numW)}.${C.reset} ` : "";
+    const numLen = numbered ? numW + 2 : 0;
+    const tag = r.tag ? `${r.tag}  ` : "";
+    const tick = r.current ? " ✔" : "";
+    const right = r.value != null ? String(r.value) : r.hint || "";
+    const used = 2 + numLen + tag.length + tick.length;
+
+    let label = String(r.label);
+    let rightText = right;
+    if (rightText) {
+      const maxRight = r.value != null ? rightText.length : Math.max(0, cw - used - Math.min(label.length, 12) - 3);
+      rightText = fit(rightText, maxRight);
+    }
+    const labelMax = Math.max(4, cw - used - (rightText ? rightText.length + 2 : 0));
+    label = fit(label, labelMax);
+    const gap = Math.max(1, cw - used - label.length - rightText.length);
+
+    const tagS = r.tag ? `${T.warn}${r.tag}${C.reset}  ` : "";
+    const labelS = on ? `${C.bold}${T.brand}${label}${C.reset}` : `${T.text}${label}${C.reset}`;
+    const tickS = r.current ? ` ${T.ok}✔${C.reset}` : "";
+    const rightS = rightText ? `${r.value != null && on ? T.accent : C.dim}${rightText}${C.reset}` : "";
+    body.push(`${lead}${num}${tagS}${labelS}${tickS}${" ".repeat(gap)}${rightS}`);
+  });
+  if (preview.length) {
+    body.push("");
+    for (const p of preview) body.push(p);
+  }
+  return frame(body, { width, title: `${C.bold}${T.text}${title}${C.reset}`, color: T.borderHi });
+}
+
+// A little sample of how a run looks, for the theme picker's live preview.
+function previewLines() {
+  return [
+    `${C.dim}preview${C.reset}`,
+    `${T.brand}◆ planner${C.reset} ${C.dim}groq · 1.2s${C.reset}`,
+    `${T.accent}●${C.reset} ${C.bold}Edit${C.reset} src/app.js`,
+    `  ${T.err}-${C.reset} ${C.dim}const total = a + b${C.reset}`,
+    `  ${T.ok}+${C.reset} ${C.dim}const total = add(a, b)${C.reset}`,
+    `${T.ok}✓${C.reset} ${C.bold}Done${C.reset} ${C.dim}· ${T.warn}⚠${C.reset}${C.dim} warning · ${T.err}✗${C.reset}${C.dim} error${C.reset}`,
+  ];
+}
+
+// ── Spinner ─────────────────────────────────────────────────────────────────
 class Spinner {
   constructor(label) {
     this.label = label;
     this.frame = 0;
     this.start = Date.now();
     this.timer = null;
+    this.drawn = false;
   }
   go() {
     if (!process.stdout.isTTY) return;
+    if (!S.animations) {
+      process.stdout.write(`${bar()} ${T.accent}◌${C.reset} ${C.dim}${this.label}…${C.reset}`);
+      this.drawn = true;
+      return;
+    }
     const FR = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     this.timer = setInterval(() => {
       process.stdout.write(
-        `\r${BAR} ${AQUA}${FR[this.frame % FR.length]}${C.reset} ${C.dim}${this.label} · ${fmtDuration(Date.now() - this.start)}${C.reset}   `
+        `\r${bar()} ${T.accent}${FR[this.frame % FR.length]}${C.reset} ${C.dim}${this.label} · ${fmtDuration(Date.now() - this.start)}${C.reset}   `
       );
       this.frame++;
+      this.drawn = true;
     }, 80);
   }
   stop() {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+    if (this.drawn) {
+      this.drawn = false;
       process.stdout.write("\r\x1b[K");
     }
   }
@@ -344,14 +552,15 @@ function createRenderer() {
     }
   };
   const w = () => termWidth();
+  const full = () => S.toolDetail === "full";
 
   function diffLines(text, sign, color) {
+    const max = full() ? 12 : 5;
     const lines = String(text ?? "").split("\n");
-    const shown = lines.slice(0, 5);
-    for (const l of shown) {
+    for (const l of lines.slice(0, max)) {
       emit(`      ${color}${sign}${C.reset} ${C.dim}${fit(l, w() - 10)}${C.reset}`);
     }
-    if (lines.length > 5) emit(`      ${C.dim}  … +${lines.length - 5} more lines${C.reset}`);
+    if (lines.length > max) emit(`      ${C.dim}  … +${lines.length - max} more lines${C.reset}`);
   }
 
   function onEvent(type, payload) {
@@ -377,19 +586,20 @@ function createRenderer() {
         usage[roleKey][name] = (usage[roleKey][name] || 0) + 1;
         const tag =
           role === "planner"
-            ? `${VIOLET}◆ planner${C.reset}`
+            ? `${T.brand}◆ planner${C.reset}`
             : role === "executor"
-              ? `${AQUA}◆ executor${C.reset}`
+              ? `${T.accent}◆ executor${C.reset}`
               : `${C.gray}◆ model${C.reset}`;
         emit(`\n  ${tag} ${C.dim}${name} · ${fmtMs(payload.ms)}${C.reset}`);
         break;
       }
 
       case "thought": {
-        if (!payload) break;
+        if (!payload || !S.showThoughts) break;
+        const max = full() ? 6 : 3;
         const lines = wrap(payload, w() - 6);
-        const shown = lines.slice(0, 3);
-        if (lines.length > 3) shown[2] = fit(shown[2], w() - 7) + "…";
+        const shown = lines.slice(0, max);
+        if (lines.length > max) shown[max - 1] = fit(shown[max - 1], w() - 7) + "…";
         for (const l of shown) emit(`    ${C.italic}${C.dim}${l.replace(/[`*]/g, "")}${C.reset}`);
         break;
       }
@@ -401,9 +611,9 @@ function createRenderer() {
         const name = exec ? raw.slice(9) : raw;
         lastName = name;
         const args = payload.args || {};
-        const dot = exec ? AQUA : VIOLET;
+        const dot = exec ? T.accent : T.brand;
         const verb = VERBS[name] || name;
-        let target = fit(firstStringArg(args), w() - verb.length - 12);
+        const target = fit(firstStringArg(args), w() - verb.length - 12);
         let extra = "";
         if (name === "write_file" && typeof args.content === "string") {
           extra = ` ${C.dim}· ${args.content.replace(/\n$/, "").split("\n").length} lines${C.reset}`;
@@ -411,12 +621,13 @@ function createRenderer() {
         emit(`  ${dot}●${C.reset} ${C.bold}${verb}${C.reset} ${C.dim}${name === "instruct" ? "→ " : ""}${C.reset}${target}${extra}`);
         if (name === "instruct" && typeof args.task === "string") {
           const tl = wrap(args.task, w() - 8);
-          for (const l of tl.slice(0, 2)) emit(`    ${C.dim}${l}${C.reset}`);
-          if (tl.length > 2) emit(`    ${C.dim}…${C.reset}`);
+          const max = full() ? 6 : 2;
+          for (const l of tl.slice(0, max)) emit(`    ${C.dim}${l}${C.reset}`);
+          if (tl.length > max) emit(`    ${C.dim}…${C.reset}`);
         }
         if (name === "edit_file" && args.old_str != null) {
-          diffLines(args.old_str, "-", ROSE);
-          diffLines(args.new_str, "+", MINT);
+          diffLines(args.old_str, "-", T.err);
+          diffLines(args.new_str, "+", T.ok);
         }
         break;
       }
@@ -425,16 +636,17 @@ function createRenderer() {
         const out = String(payload.output ?? "").replace(/\s+$/, "");
         const lines = out ? out.split("\n") : [];
         const showAll = lastName === "run_shell" || lastName === "run_tests";
-        const limit = 6;
+        const limit = full() ? 16 : 6;
+        const collapseOk = payload.ok && !showAll && !full();
         let shown;
-        if (lines.length <= (payload.ok && !showAll ? 1 : limit)) shown = lines.map((t) => ({ t }));
-        else if (payload.ok && !showAll) shown = [{ t: lines[0] }, { more: lines.length - 1 }];
+        if (lines.length <= (collapseOk ? 1 : limit)) shown = lines.map((t) => ({ t }));
+        else if (collapseOk) shown = [{ t: lines[0] }, { more: lines.length - 1 }];
         else {
           const head = limit - 2;
           shown = [...lines.slice(0, head).map((t) => ({ t })), { more: lines.length - head - 1 }, { t: lines[lines.length - 1] }];
         }
         if (!shown.length) shown = [{ t: "(no output)" }];
-        const mark = payload.ok ? `${MINT}✓${C.reset}` : `${ROSE}✗${C.reset}`;
+        const mark = payload.ok ? `${T.ok}✓${C.reset}` : `${T.err}✗${C.reset}`;
         shown.forEach((s, i) => {
           const lead = i === 0 ? `    ${C.dim}⎿${C.reset} ${mark} ` : "        ";
           if (s.more != null) emit(`        ${C.dim}… +${s.more} lines${C.reset}`);
@@ -445,7 +657,7 @@ function createRenderer() {
 
       case "warn": {
         const ls = wrap(payload, w() - 6);
-        emit(`  ${AMBER}⚠${C.reset} ${C.dim}${ls[0] || ""}${C.reset}`);
+        emit(`  ${T.warn}⚠${C.reset} ${C.dim}${ls[0] || ""}${C.reset}`);
         for (const l of ls.slice(1, 4)) emit(`    ${C.dim}${l}${C.reset}`);
         break;
       }
@@ -453,7 +665,7 @@ function createRenderer() {
       case "error": {
         stopSpinner();
         const ls = wrap(payload, w() - 6);
-        emit(`  ${ROSE}✗${C.reset} ${ls[0] || ""}`);
+        emit(`  ${T.err}✗${C.reset} ${ls[0] || ""}`);
         for (const l of ls.slice(1, 6)) emit(`    ${C.dim}${l}${C.reset}`);
         if (ls.length > 6) emit(`    ${C.dim}…${C.reset}`);
         break;
@@ -461,14 +673,14 @@ function createRenderer() {
 
       case "blocked": {
         stopSpinner();
-        emit(`\n  ${AMBER}${C.bold}? Rin needs your input${C.reset}`);
+        emit(`\n  ${T.warn}${C.bold}? Rin needs your input${C.reset}`);
         for (const l of wrap(payload, w() - 6)) emit(`    ${md(l)}`);
         break;
       }
 
       case "done": {
         stopSpinner();
-        emit(`\n  ${MINT}${C.bold}✓ Done${C.reset}`);
+        emit(`\n  ${T.ok}${C.bold}✓ Done${C.reset}`);
         for (const l of wrap(payload, w() - 6)) emit(`    ${md(l)}`);
         break;
       }
@@ -508,21 +720,16 @@ function runFooter({ status, steps, ms, models }) {
 
 module.exports = {
   C,
-  VIOLET,
-  AQUA,
-  AMBER,
-  MINT,
-  ROSE,
-  PROMPT_GLYPH,
-  ASK_GLYPH,
-  PROMPT_LINE,
-  BAR,
-  GUT,
+  T,
+  S,
+  THEMES,
+  THEME_ORDER,
+  setTheme,
+  applySettings,
+  bar,
   emit,
   gutterSection,
   closeBar,
-  inputTop,
-  inputBottom,
   LOGO,
   vlen,
   md,
@@ -537,7 +744,15 @@ module.exports = {
   rule,
   sectionHeader,
   box,
+  frame,
+  hintRow,
   welcome,
+  welcomeLines,
+  inputFrame,
+  suggestLines,
+  menuFrame,
+  previewLines,
+  brandGradient,
   createRenderer,
   runFooter,
 };
