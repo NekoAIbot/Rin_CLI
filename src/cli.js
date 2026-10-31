@@ -85,7 +85,7 @@ async function printChangeSummary(projectDir, touched) {
     }
   }
 
-  sectionHeader("Files");
+  ui.gutterSection("Files");
   const nameW = Math.min(Math.max(...files.map((p) => p.length)), ui.termWidth() - 24);
   for (const p of files) {
     let lines = "";
@@ -98,9 +98,9 @@ async function printChangeSummary(projectDir, touched) {
     else if (code === "??" || code === "A") mark = `${MINT}+${C.reset}`;
     else if (code) mark = `${AMBER}~${C.reset}`;
     else mark = `${C.dim}·${C.reset}`;
-    console.log(`  ${mark} ${fit(p, nameW).padEnd(nameW)}  ${C.dim}${lines}${C.reset}`);
+    ui.emit(`  ${mark} ${fit(p, nameW).padEnd(nameW)}  ${C.dim}${lines}${C.reset}`);
   }
-  if (isGitRepo) console.log(`\n  ${C.dim}+ new · ~ modified · · unchanged (read only)${C.reset}`);
+  if (isGitRepo) ui.emit(`\n  ${C.dim}+ new · ~ modified · · unchanged (read only)${C.reset}`);
 }
 
 function fmtSessionLine(s, idx) {
@@ -120,6 +120,7 @@ function printHelp() {
     ["/compact [id]", "shrink a session's history"],
     ["/memory", "what Rin remembers"],
     ["/remember <text>", "save a fact to memory"],
+    ["!<command>", "run a shell command here"],
     ["/help", "this list"],
     ["/exit", "quit"],
   ];
@@ -402,6 +403,22 @@ async function main() {
     }
   }
 
+  // `!ls -la` — run a shell command directly, rendered inside the gutter.
+  async function runShellLine(cmd) {
+    if (!cmd) {
+      console.log(`  ${C.dim}Usage: !<shell command>${C.reset}`);
+      return;
+    }
+    ui.emit(`\n  ${ui.VIOLET}$${C.reset} ${fit(cmd, ui.termWidth() - 6)}`);
+    const r = await tools.runShell(projectDir, cmd);
+    const text = String(r.output || "").replace(/\s+$/, "");
+    const lines = text ? text.split("\n") : ["(no output)"];
+    for (const l of lines.slice(0, 40)) ui.emit(`    ${C.dim}${fit(l, ui.termWidth() - 8)}${C.reset}`);
+    if (lines.length > 40) ui.emit(`    ${C.dim}… +${lines.length - 40} more lines${C.reset}`);
+    ui.emit("");
+    ui.closeBar(r.ok ? "done" : "exited with an error", r.ok);
+  }
+
   async function compactSession(idArg) {
     const target = idArg ? loadSession(projectDir, idArg) : latestSession(projectDir);
     if (!target || !target.history) {
@@ -450,6 +467,9 @@ async function main() {
     return;
   }
   if (goalFromArgv) {
+    ui.inputTop(model ? `pinned ${model}` : "auto · planner → executor");
+    console.log(`${ui.PROMPT_LINE}${goalFromArgv}`);
+    ui.inputBottom();
     await runGoal(goalFromArgv);
     rl.close();
     return;
@@ -457,9 +477,14 @@ async function main() {
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    console.log(ui.rule());
-    const line = (await ask(rl, `${PROMPT_GLYPH} `)).trim();
+    ui.inputTop(model ? `pinned ${model}` : "auto · planner → executor");
+    const line = (await ask(rl, ui.PROMPT_LINE)).trim();
+    ui.inputBottom();
     if (!line) continue;
+    if (line.startsWith("!")) {
+      await runShellLine(line.slice(1).trim());
+      continue;
+    }
     if (line === "/exit" || line === "/quit") break;
     if (line === "/help") {
       printHelp();

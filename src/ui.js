@@ -161,32 +161,124 @@ function box(lines, width) {
 const PROMPT_GLYPH = `${C.bold}${AQUA}❯${C.reset}`;
 const ASK_GLYPH = `${C.bold}${AMBER}❯${C.reset}`;
 
+// ── The gutter ──────────────────────────────────────────────────────────────
+// Everything Rin does during a run hangs off one continuous vertical bar on
+// the left (the way Antigravity frames agent activity), opened by the input
+// box's bottom edge and closed by the footer's ╰. `emit` turns any line that
+// starts with two spaces into a bar line, so renderers just write indented text.
+const GUT = `${C.dim}${VIOLET}`;
+const BAR = `${GUT}│${C.reset}`;
+
+function emit(s = "") {
+  for (const seg of String(s).split("\n")) {
+    if (seg === "") console.log(BAR);
+    else if (seg.startsWith("  ")) console.log(BAR + seg.slice(1));
+    else console.log(seg);
+  }
+}
+
+function gutterSection(title) {
+  emit(`\n  ${C.bold}${C.white}${title}${C.reset}`);
+}
+
+// Close the bar: ╰ ✓ completed · 7 steps · 42s
+function closeBar(text, ok = true) {
+  console.log(`${GUT}╰${C.reset} ${ok ? MINT : AMBER}${ok ? "✓" : "■"}${C.reset} ${C.dim}${text}${C.reset}`);
+}
+
+// ── The logo ────────────────────────────────────────────────────────────────
+// Original block-letter mark, drawn with half-blocks (3 rows × 17 cols) and
+// painted with a diagonal violet → aqua gradient.
+const LOGO = [
+  "█▀▀▀▄  ▀█▀  █▄  █",
+  "█▄▄▄▀   █   █ ▀▄█",
+  "█  ▀▄  ▄█▄  █   █",
+];
+
+function paintLogo(rows) {
+  const W = Math.max(...rows.map((r) => r.length));
+  const H = rows.length;
+  return rows.map((row, y) => {
+    let out = "";
+    for (let x = 0; x < row.length; x++) {
+      const ch = row[x];
+      if (ch === " ") {
+        out += " ";
+        continue;
+      }
+      const t = Math.min(1, (x / (W - 1)) * 0.75 + (y / (H - 1)) * 0.25);
+      const r = Math.round(192 + (34 - 192) * t);
+      const g = Math.round(132 + (211 - 132) * t);
+      const b = Math.round(252 + (238 - 252) * t);
+      out += `\x1b[38;2;${r};${g};${b}m${ch}`;
+    }
+    return `${C.bold}${out}${C.reset}`;
+  });
+}
+
 function welcome({ projectDir, mode, sessionCount, lastGoal, memoryConfigured, version, inOwnSource }) {
   const w = termWidth();
-  const cw = w - 4;
-  const label = (k) => `${C.dim}${k.padEnd(9)}${C.reset}`;
-  const rows = [
-    `${C.bold}${gradientText("✻ rin", [192, 132, 252], [34, 211, 238])}${C.reset}${version ? `  ${C.dim}v${version}${C.reset}` : ""}`,
-    `${C.dim}${fit("agentic coding · free-tier models · shared memory", cw)}${C.reset}`,
-    "",
-    `${label("cwd")}${shortPath(projectDir, cw - 9)}`,
-    `${label("mode")}${fit(mode, cw - 9)}`,
-    `${label("memory")}${memoryConfigured ? `${MINT}●${C.reset} linked ${C.dim}· /memory${C.reset}` : `${C.dim}○ not configured${C.reset}`}`,
+  const logo = paintLogo(LOGO);
+  const side = [
+    `${C.bold}${C.white}Rin${C.reset}${version ? ` ${C.dim}v${version}${C.reset}` : ""}`,
+    `${C.dim}agentic coding in your terminal${C.reset}`,
+    `${C.dim}free-tier models · shared memory${C.reset}`,
   ];
+  const logoW = LOGO[0].length;
+  const wide = w >= logoW + 4 + 32;
+
+  console.log();
+  if (wide) {
+    for (let i = 0; i < logo.length; i++) console.log(`  ${logo[i]}    ${clipAnsi(side[i], w - logoW - 6)}`);
+  } else {
+    for (const l of logo) console.log(`  ${l}`);
+    for (const s of side) console.log(`  ${clipAnsi(s, w - 2)}`);
+  }
+
+  const label = (k) => `${C.dim}${k.padEnd(9)}${C.reset}`;
+  const avail = w - 4 - 9;
+  console.log();
+  console.log(`  ${label("cwd")}${shortPath(projectDir, avail)}`);
+  console.log(`  ${label("mode")}${fit(mode, avail)}`);
+  console.log(
+    `  ${label("memory")}${memoryConfigured ? `${MINT}●${C.reset} linked ${C.dim}· /memory${C.reset}` : `${C.dim}○ not configured${C.reset}`}`
+  );
   if (sessionCount) {
-    rows.push("");
-    rows.push(`${label("resume")}${AMBER}↳${C.reset} ${fit(lastGoal || "last session", cw - 12)}`);
-    rows.push(`${label("")}${C.dim}${sessionCount} saved · /continue latest · /resume pick${C.reset}`);
+    console.log(`  ${label("resume")}${AMBER}↳${C.reset} ${fit(lastGoal || "last session", avail - 3)}`);
+    console.log(`  ${label("")}${C.dim}${fit(`${sessionCount} saved · /continue latest · /resume pick`, avail)}${C.reset}`);
   }
   console.log();
-  console.log(box(rows, w));
-  console.log(`  ${C.dim}${fit("/help commands · ↑ history · ctrl+c twice to exit", w - 4)}${C.reset}`);
+  console.log(`  ${C.dim}${fit("/help · !shell · tab completes · ctrl+c twice exits", w - 4)}${C.reset}`);
   if (inOwnSource) {
     console.log(
       `\n  ${AMBER}⚠${C.reset} ${C.dim}You're inside Rin's own source folder — edits here change the tool itself. cd to a project folder first.${C.reset}`
     );
   }
-  console.log();
+}
+
+// ── The input box ───────────────────────────────────────────────────────────
+//   ╭─ rin ─────────────────── auto · planner → executor ─
+//   │ ❯ type here…
+//   ╰──────────────────────────────────────────────────────
+// Open on the right on purpose: a fixed right border can't survive typing
+// past the edge, but top + left + bottom always can. The mode sits in the
+// top-right (where Antigravity shows its model name).
+const PROMPT_LINE = `${C.dim}${VIOLET}│${C.reset} ${PROMPT_GLYPH} `;
+
+function inputTop(right) {
+  const w = termWidth();
+  const leftLen = 7; // "╭─ rin "
+  let r = right ? String(right) : "";
+  if (r && w - leftLen - (r.length + 3) < 4) r = "";
+  const fill = Math.max(2, w - leftLen - (r ? r.length + 3 : 0));
+  const tail = r ? ` ${C.dim}${r}${C.reset} ${GUT}─${C.reset}` : "";
+  console.log(
+    `\n${GUT}╭─${C.reset} ${gradientText("rin", [192, 132, 252], [34, 211, 238])} ${GUT}${"─".repeat(fill)}${C.reset}${tail}`
+  );
+}
+
+function inputBottom() {
+  console.log(`${GUT}╰${"─".repeat(termWidth() - 1)}${C.reset}`);
 }
 
 class Spinner {
@@ -201,7 +293,7 @@ class Spinner {
     const FR = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     this.timer = setInterval(() => {
       process.stdout.write(
-        `\r  ${AQUA}${FR[this.frame % FR.length]}${C.reset} ${C.dim}${this.label} · ${fmtDuration(Date.now() - this.start)}${C.reset}   `
+        `\r${BAR} ${AQUA}${FR[this.frame % FR.length]}${C.reset} ${C.dim}${this.label} · ${fmtDuration(Date.now() - this.start)}${C.reset}   `
       );
       this.frame++;
     }, 80);
@@ -257,9 +349,9 @@ function createRenderer() {
     const lines = String(text ?? "").split("\n");
     const shown = lines.slice(0, 5);
     for (const l of shown) {
-      console.log(`      ${color}${sign}${C.reset} ${C.dim}${fit(l, w() - 10)}${C.reset}`);
+      emit(`      ${color}${sign}${C.reset} ${C.dim}${fit(l, w() - 10)}${C.reset}`);
     }
-    if (lines.length > 5) console.log(`      ${C.dim}  … +${lines.length - 5} more lines${C.reset}`);
+    if (lines.length > 5) emit(`      ${C.dim}  … +${lines.length - 5} more lines${C.reset}`);
   }
 
   function onEvent(type, payload) {
@@ -289,7 +381,7 @@ function createRenderer() {
             : role === "executor"
               ? `${AQUA}◆ executor${C.reset}`
               : `${C.gray}◆ model${C.reset}`;
-        console.log(`\n  ${tag} ${C.dim}${name} · ${fmtMs(payload.ms)}${C.reset}`);
+        emit(`\n  ${tag} ${C.dim}${name} · ${fmtMs(payload.ms)}${C.reset}`);
         break;
       }
 
@@ -298,7 +390,7 @@ function createRenderer() {
         const lines = wrap(payload, w() - 6);
         const shown = lines.slice(0, 3);
         if (lines.length > 3) shown[2] = fit(shown[2], w() - 7) + "…";
-        for (const l of shown) console.log(`    ${C.italic}${C.dim}${l.replace(/[`*]/g, "")}${C.reset}`);
+        for (const l of shown) emit(`    ${C.italic}${C.dim}${l.replace(/[`*]/g, "")}${C.reset}`);
         break;
       }
 
@@ -316,11 +408,11 @@ function createRenderer() {
         if (name === "write_file" && typeof args.content === "string") {
           extra = ` ${C.dim}· ${args.content.replace(/\n$/, "").split("\n").length} lines${C.reset}`;
         }
-        console.log(`  ${dot}●${C.reset} ${C.bold}${verb}${C.reset} ${C.dim}${name === "instruct" ? "→ " : ""}${C.reset}${target}${extra}`);
+        emit(`  ${dot}●${C.reset} ${C.bold}${verb}${C.reset} ${C.dim}${name === "instruct" ? "→ " : ""}${C.reset}${target}${extra}`);
         if (name === "instruct" && typeof args.task === "string") {
           const tl = wrap(args.task, w() - 8);
-          for (const l of tl.slice(0, 2)) console.log(`    ${C.dim}${l}${C.reset}`);
-          if (tl.length > 2) console.log(`    ${C.dim}…${C.reset}`);
+          for (const l of tl.slice(0, 2)) emit(`    ${C.dim}${l}${C.reset}`);
+          if (tl.length > 2) emit(`    ${C.dim}…${C.reset}`);
         }
         if (name === "edit_file" && args.old_str != null) {
           diffLines(args.old_str, "-", ROSE);
@@ -345,39 +437,39 @@ function createRenderer() {
         const mark = payload.ok ? `${MINT}✓${C.reset}` : `${ROSE}✗${C.reset}`;
         shown.forEach((s, i) => {
           const lead = i === 0 ? `    ${C.dim}⎿${C.reset} ${mark} ` : "        ";
-          if (s.more != null) console.log(`        ${C.dim}… +${s.more} lines${C.reset}`);
-          else console.log(`${lead}${i === 0 && payload.ok ? "" : C.dim}${fit(s.t, w() - 12)}${C.reset}`);
+          if (s.more != null) emit(`        ${C.dim}… +${s.more} lines${C.reset}`);
+          else emit(`${lead}${i === 0 && payload.ok ? "" : C.dim}${fit(s.t, w() - 12)}${C.reset}`);
         });
         break;
       }
 
       case "warn": {
         const ls = wrap(payload, w() - 6);
-        console.log(`  ${AMBER}⚠${C.reset} ${C.dim}${ls[0] || ""}${C.reset}`);
-        for (const l of ls.slice(1, 4)) console.log(`    ${C.dim}${l}${C.reset}`);
+        emit(`  ${AMBER}⚠${C.reset} ${C.dim}${ls[0] || ""}${C.reset}`);
+        for (const l of ls.slice(1, 4)) emit(`    ${C.dim}${l}${C.reset}`);
         break;
       }
 
       case "error": {
         stopSpinner();
         const ls = wrap(payload, w() - 6);
-        console.log(`  ${ROSE}✗${C.reset} ${ls[0] || ""}`);
-        for (const l of ls.slice(1, 6)) console.log(`    ${C.dim}${l}${C.reset}`);
-        if (ls.length > 6) console.log(`    ${C.dim}…${C.reset}`);
+        emit(`  ${ROSE}✗${C.reset} ${ls[0] || ""}`);
+        for (const l of ls.slice(1, 6)) emit(`    ${C.dim}${l}${C.reset}`);
+        if (ls.length > 6) emit(`    ${C.dim}…${C.reset}`);
         break;
       }
 
       case "blocked": {
         stopSpinner();
-        console.log(`\n  ${AMBER}${C.bold}? Rin needs your input${C.reset}`);
-        for (const l of wrap(payload, w() - 6)) console.log(`    ${md(l)}`);
+        emit(`\n  ${AMBER}${C.bold}? Rin needs your input${C.reset}`);
+        for (const l of wrap(payload, w() - 6)) emit(`    ${md(l)}`);
         break;
       }
 
       case "done": {
         stopSpinner();
-        console.log(`\n  ${MINT}${C.bold}✓ Done${C.reset}`);
-        for (const l of wrap(payload, w() - 6)) console.log(`    ${md(l)}`);
+        emit(`\n  ${MINT}${C.bold}✓ Done${C.reset}`);
+        for (const l of wrap(payload, w() - 6)) emit(`    ${md(l)}`);
         break;
       }
     }
@@ -407,9 +499,10 @@ function runFooter({ status, steps, ms, models }) {
   const bits = [ok ? "completed" : `stopped (${status})`];
   if (typeof steps === "number") bits.push(`${steps} step${steps === 1 ? "" : "s"}`);
   bits.push(fmtDuration(ms));
-  console.log(`\n  ${ok ? MINT : AMBER}${ok ? "✓" : "■"}${C.reset} ${C.dim}${bits.join(" · ")}${C.reset}`);
+  emit("");
+  closeBar(bits.join(" · "), ok);
   if (models) {
-    for (const l of wrap(models, termWidth() - 4)) console.log(`    ${C.dim}${l}${C.reset}`);
+    for (const l of wrap(models, termWidth() - 4)) console.log(`  ${C.dim}${l}${C.reset}`);
   }
 }
 
@@ -422,6 +515,15 @@ module.exports = {
   ROSE,
   PROMPT_GLYPH,
   ASK_GLYPH,
+  PROMPT_LINE,
+  BAR,
+  GUT,
+  emit,
+  gutterSection,
+  closeBar,
+  inputTop,
+  inputBottom,
+  LOGO,
   vlen,
   md,
   clipAnsi,
