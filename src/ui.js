@@ -27,7 +27,19 @@ const ROSE = rgb(248, 113, 113); // failure
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const vlen = (s) => s.replace(ANSI_RE, "").length;
-const termWidth = () => Math.min(Math.max(process.stdout.columns || 60, 32), 72);
+// Leave a 2-column margin: a line exactly as wide as the terminal sits in the
+// "pending wrap" state, which Termux (and copy/paste out of it) treats as a
+// soft-wrapped line — that's what glued box edges and the prompt together.
+const termWidth = () => Math.min(Math.max((process.stdout.columns || 62) - 2, 24), 72);
+
+// Inline markdown-lite for text the model writes (summaries, thoughts):
+// **bold** and `code`. Applied per wrapped line, so a marker pair split
+// across a line break simply stays literal instead of corrupting colors.
+function md(line) {
+  return String(line)
+    .replace(/`([^`]+)`/g, `${AQUA}$1${C.reset}`)
+    .replace(/\*\*([^*]+)\*\*/g, `${C.bold}$1${C.reset}`);
+}
 
 function fmtMs(ms) {
   if (ms == null) return "";
@@ -111,11 +123,34 @@ function sectionHeader(title) {
   console.log(`${C.dim}${"─".repeat(Math.min(termWidth(), 56))}${C.reset}`);
 }
 
+// Cut a styled string to `max` VISIBLE characters, copying escape sequences
+// through untouched so colors never leak or break.
+function clipAnsi(s, max) {
+  if (vlen(s) <= max) return s;
+  let out = "";
+  let seen = 0;
+  for (let i = 0; i < s.length; ) {
+    if (s[i] === "\x1b") {
+      const m = /^\x1b\[[0-9;]*m/.exec(s.slice(i));
+      if (m) {
+        out += m[0];
+        i += m[0].length;
+        continue;
+      }
+    }
+    if (seen >= max - 1) break;
+    out += s[i++];
+    seen++;
+  }
+  return out + "…" + C.reset;
+}
+
 function box(lines, width) {
   const cw = width - 4;
   const out = [];
   out.push(`${C.dim}╭${"─".repeat(width - 2)}╮${C.reset}`);
-  for (const line of lines) {
+  for (const raw of lines) {
+    const line = clipAnsi(raw, cw);
     const pad = Math.max(0, cw - vlen(line));
     out.push(`${C.dim}│${C.reset} ${line}${" ".repeat(pad)} ${C.dim}│${C.reset}`);
   }
@@ -126,7 +161,7 @@ function box(lines, width) {
 const PROMPT_GLYPH = `${C.bold}${AQUA}❯${C.reset}`;
 const ASK_GLYPH = `${C.bold}${AMBER}❯${C.reset}`;
 
-function welcome({ projectDir, mode, sessionCount, version, inOwnSource }) {
+function welcome({ projectDir, mode, sessionCount, lastGoal, memoryConfigured, version, inOwnSource }) {
   const w = termWidth();
   const cw = w - 4;
   const label = (k) => `${C.dim}${k.padEnd(9)}${C.reset}`;
@@ -136,9 +171,12 @@ function welcome({ projectDir, mode, sessionCount, version, inOwnSource }) {
     "",
     `${label("cwd")}${shortPath(projectDir, cw - 9)}`,
     `${label("mode")}${fit(mode, cw - 9)}`,
+    `${label("memory")}${memoryConfigured ? `${MINT}●${C.reset} linked ${C.dim}· /memory${C.reset}` : `${C.dim}○ not configured${C.reset}`}`,
   ];
   if (sessionCount) {
-    rows.push(`${label("sessions")}${sessionCount} saved ${C.dim}· /resume${C.reset}`);
+    rows.push("");
+    rows.push(`${label("resume")}${AMBER}↳${C.reset} ${fit(lastGoal || "last session", cw - 12)}`);
+    rows.push(`${label("")}${C.dim}${sessionCount} saved · /continue latest · /resume pick${C.reset}`);
   }
   console.log();
   console.log(box(rows, w));
@@ -204,6 +242,9 @@ function firstStringArg(args) {
 function createRenderer() {
   let spinner = null;
   let lastName = "";
+  // role -> { provider -> call count } for the current run, so the footer can
+  // say who actually did the work (and which fallbacks kicked in).
+  let usage = {};
   const stopSpinner = () => {
     if (spinner) {
       spinner.stop();
@@ -239,6 +280,9 @@ function createRenderer() {
           role = m.slice(0, i);
           name = m.slice(i + 1);
         }
+        const roleKey = role || "model";
+        usage[roleKey] = usage[roleKey] || {};
+        usage[roleKey][name] = (usage[roleKey][name] || 0) + 1;
         const tag =
           role === "planner"
             ? `${VIOLET}◆ planner${C.reset}`
@@ -254,7 +298,7 @@ function createRenderer() {
         const lines = wrap(payload, w() - 6);
         const shown = lines.slice(0, 3);
         if (lines.length > 3) shown[2] = fit(shown[2], w() - 7) + "…";
-        for (const l of shown) console.log(`    ${C.italic}${C.dim}${l}${C.reset}`);
+        for (const l of shown) console.log(`    ${C.italic}${C.dim}${l.replace(/[`*]/g, "")}${C.reset}`);
         break;
       }
 
@@ -270,7 +314,7 @@ function createRenderer() {
         let target = fit(firstStringArg(args), w() - verb.length - 12);
         let extra = "";
         if (name === "write_file" && typeof args.content === "string") {
-          extra = ` ${C.dim}· ${args.content.split("\n").length} lines${C.reset}`;
+          extra = ` ${C.dim}· ${args.content.replace(/\n$/, "").split("\n").length} lines${C.reset}`;
         }
         console.log(`  ${dot}●${C.reset} ${C.bold}${verb}${C.reset} ${C.dim}${name === "instruct" ? "→ " : ""}${C.reset}${target}${extra}`);
         if (name === "instruct" && typeof args.task === "string") {
@@ -326,28 +370,47 @@ function createRenderer() {
       case "blocked": {
         stopSpinner();
         console.log(`\n  ${AMBER}${C.bold}? Rin needs your input${C.reset}`);
-        for (const l of wrap(payload, w() - 6)) console.log(`    ${l}`);
+        for (const l of wrap(payload, w() - 6)) console.log(`    ${md(l)}`);
         break;
       }
 
       case "done": {
         stopSpinner();
         console.log(`\n  ${MINT}${C.bold}✓ Done${C.reset}`);
-        for (const l of wrap(payload, w() - 6)) console.log(`    ${l}`);
+        for (const l of wrap(payload, w() - 6)) console.log(`    ${md(l)}`);
         break;
       }
     }
   }
 
-  return { onEvent, stop: stopSpinner };
+  // "planner groq ×3 · executor groq ×4, nvidia ×1" — and resets for the next run.
+  function takeUsage() {
+    const order = ["planner", "executor", "model"];
+    const parts = [];
+    for (const role of order) {
+      const m = usage[role];
+      if (!m) continue;
+      const list = Object.entries(m)
+        .map(([n, c]) => `${n} ×${c}`)
+        .join(", ");
+      parts.push(`${role} ${list}`);
+    }
+    usage = {};
+    return parts.join(" · ");
+  }
+
+  return { onEvent, stop: stopSpinner, takeUsage };
 }
 
-function runFooter({ status, steps, ms }) {
+function runFooter({ status, steps, ms, models }) {
   const ok = status === "done";
   const bits = [ok ? "completed" : `stopped (${status})`];
   if (typeof steps === "number") bits.push(`${steps} step${steps === 1 ? "" : "s"}`);
   bits.push(fmtDuration(ms));
   console.log(`\n  ${ok ? MINT : AMBER}${ok ? "✓" : "■"}${C.reset} ${C.dim}${bits.join(" · ")}${C.reset}`);
+  if (models) {
+    for (const l of wrap(models, termWidth() - 4)) console.log(`    ${C.dim}${l}${C.reset}`);
+  }
 }
 
 module.exports = {
@@ -360,6 +423,8 @@ module.exports = {
   PROMPT_GLYPH,
   ASK_GLYPH,
   vlen,
+  md,
+  clipAnsi,
   termWidth,
   fmtMs,
   fmtDuration,

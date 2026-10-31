@@ -60,32 +60,47 @@ function ask(rl, question) {
   return new Promise((resolve) => rl.question(question, resolve));
 }
 
+// What this run touched, with a marker for new / modified / read-only. In a
+// git repo the marker comes from `git status` (so NEW files show up — the old
+// `git diff --stat` only ever listed already-tracked files and silently
+// missed everything Rin created); otherwise it's just the file list.
 async function printChangeSummary(projectDir, touched) {
+  const files = (touched || []).filter((p) => {
+    try {
+      return fs.statSync(path.join(projectDir, p)).isFile();
+    } catch {
+      return false;
+    }
+  });
+  if (!files.length) return;
+
+  const status = {};
   const isGitRepo = fs.existsSync(path.join(projectDir, ".git"));
   if (isGitRepo) {
-    const diff = await tools.runShell(projectDir, "git diff --stat 2>/dev/null");
-    if (diff.ok && diff.output.trim()) {
-      sectionHeader("Changed");
-      console.log(
-        diff.output
-          .trim()
-          .split("\n")
-          .map((l) => `  ${l}`)
-          .join("\n")
-      );
-      return;
+    const st = await tools.runShell(projectDir, "git status --porcelain -uall 2>/dev/null");
+    if (st.ok) {
+      for (const l of st.output.split("\n")) {
+        if (l.length > 3) status[l.slice(3).trim().replace(/^"|"$/g, "")] = l.slice(0, 2).trim();
+      }
     }
   }
-  if (touched && touched.length) {
-    sectionHeader("Files");
-    for (const p of touched) {
-      let size = "";
-      try {
-        size = ` ${C.dim}${fs.statSync(path.join(projectDir, p)).size} B${C.reset}`;
-      } catch {}
-      console.log(`  ${MINT}●${C.reset} ${p}${size}`);
-    }
+
+  sectionHeader("Files");
+  const nameW = Math.min(Math.max(...files.map((p) => p.length)), ui.termWidth() - 24);
+  for (const p of files) {
+    let lines = "";
+    try {
+      lines = `${fs.readFileSync(path.join(projectDir, p), "utf8").replace(/\n$/, "").split("\n").length} lines`;
+    } catch {}
+    const code = status[p];
+    let mark;
+    if (!isGitRepo) mark = `${MINT}●${C.reset}`;
+    else if (code === "??" || code === "A") mark = `${MINT}+${C.reset}`;
+    else if (code) mark = `${AMBER}~${C.reset}`;
+    else mark = `${C.dim}·${C.reset}`;
+    console.log(`  ${mark} ${fit(p, nameW).padEnd(nameW)}  ${C.dim}${lines}${C.reset}`);
   }
+  if (isGitRepo) console.log(`\n  ${C.dim}+ new · ~ modified · · unchanged (read only)${C.reset}`);
 }
 
 function fmtSessionLine(s, idx) {
@@ -97,17 +112,19 @@ function fmtSessionLine(s, idx) {
 function printHelp() {
   sectionHeader("Commands");
   const rows = [
-    ["/model [key|auto]", "switch backend, or auto for Planner/Executor"],
-    ["/status", "config, model chains, sessions, memory check"],
-    ["/continue", "resume the most recent session — no picker"],
-    ["/resume [id]", "list saved sessions and pick one"],
+    ["/model [key|auto]", "switch model, or auto split"],
+    ["/status", "config, sessions, memory check"],
+    ["/continue", "resume the latest session"],
+    ["/resume [id]", "pick a saved session"],
     ["/clear [id]", "discard a saved session"],
-    ["/compact [id]", "shrink a saved session before resuming"],
+    ["/compact [id]", "shrink a session's history"],
+    ["/memory", "what Rin remembers"],
+    ["/remember <text>", "save a fact to memory"],
     ["/help", "this list"],
     ["/exit", "quit"],
   ];
-  for (const [cmd, desc] of rows) console.log(`  ${C.bold}${cmd.padEnd(18)}${C.reset}${C.dim}${desc}${C.reset}`);
-  console.log(`\n  ${C.dim}Shell: rin --continue (-c) jumps to the latest · rin --resume (-r) shows the list${C.reset}`);
+  for (const [cmd, desc] of rows) console.log(`  ${C.bold}${cmd.padEnd(18)}${C.reset}${C.dim}${fit(desc, ui.termWidth() - 22)}${C.reset}`);
+  console.log(`\n  ${C.dim}${fit("Tab completes · shell: rin -c latest, rin -r list", ui.termWidth() - 4)}${C.reset}`);
 }
 
 async function main() {
@@ -125,19 +142,38 @@ async function main() {
   const selfDir = path.resolve(__dirname, "..");
   const inOwnSource = projectDir === selfDir || projectDir.startsWith(selfDir + path.sep);
 
-  const sessionCount = listSessions(projectDir).length;
+  const existingSessions = listSessions(projectDir);
   ui.welcome({
     projectDir,
     mode: model ? `pinned → ${model}` : "auto · planner → executor",
-    sessionCount,
+    sessionCount: existingSessions.length,
+    lastGoal: existingSessions[0] && existingSessions[0].goal,
+    memoryConfigured: !!(cfg.supabaseUrl && cfg.supabaseServiceRoleKey),
     version,
     inOwnSource,
   });
+
+  // Tab completion: slash commands, then session ids / model keys as arguments.
+  const COMMANDS = ["/model", "/status", "/continue", "/resume", "/clear", "/compact", "/memory", "/remember", "/help", "/exit"];
+  function completer(line) {
+    if (!line.startsWith("/")) return [[], line];
+    if (line.includes(" ")) {
+      const cmd = line.split(" ")[0];
+      const arg = line.slice(cmd.length + 1);
+      let pool = [];
+      if (["/resume", "/clear", "/compact"].includes(cmd)) pool = listSessions(projectDir).map((s) => s.id);
+      else if (cmd === "/model") pool = ["auto", ...listModels().map((m) => m.key)];
+      return [pool.filter((p) => p.startsWith(arg)).map((p) => `${cmd} ${p}`), line];
+    }
+    const hits = COMMANDS.filter((c) => c.startsWith(line));
+    return [hits.length ? hits : COMMANDS, line];
+  }
 
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
     historySize: HISTORY_MAX_LINES,
+    completer,
   });
   rl.history = loadHistoryLines().reverse();
 
@@ -176,8 +212,8 @@ async function main() {
     lastSigint = now;
     console.log(`\n  ${C.dim}press ctrl+c again to exit${C.reset}`);
     try {
+      // Ctrl+U clears the typed text AND redraws the prompt in one refresh.
       rl.write(null, { ctrl: true, name: "u" });
-      rl.prompt();
     } catch {}
   });
   process.on("SIGINT", () => {
@@ -214,12 +250,13 @@ async function main() {
         `\n  ${C.dim}Progress saved as ${C.reset}${C.bold}${AMBER}${activeSessionId}${C.reset}${C.dim} — ${C.reset}${C.bold}rin --continue${C.reset}${C.dim} or ${C.reset}${C.bold}rin --resume${C.reset}${C.dim} to pick it back up.${C.reset}`
       );
     }
-    ui.runFooter({ status: result.status, steps: result.steps, ms: Date.now() - t0 });
+    ui.runFooter({ status: result.status, steps: result.steps, ms: Date.now() - t0, models: renderer.takeUsage() });
     return result;
   }
 
   async function tracked(fn) {
     running = true;
+    renderer.takeUsage(); // discard any stale counts from an aborted earlier run
     const t0 = Date.now();
     try {
       const result = await fn();
@@ -321,6 +358,50 @@ async function main() {
     }
   }
 
+  const withTimeout = (p, ms) =>
+    Promise.race([p, new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms / 1000}s`)), ms))]);
+
+  function memoryProblem(err) {
+    console.log(`  ${ROSE}✗${C.reset} Memory unavailable`);
+    for (const l of ui.wrap(err.message, ui.termWidth() - 6).slice(0, 4)) console.log(`    ${C.dim}${l}${C.reset}`);
+    for (const l of ui.wrap("Check SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and RIN_USER_EMAIL in ~/.rin-cli.env", ui.termWidth() - 6)) {
+      console.log(`    ${C.dim}${l}${C.reset}`);
+    }
+  }
+
+  async function showMemory() {
+    sectionHeader("Memory");
+    try {
+      const rows = await withTimeout(memory.loadRelevantMemories(cfg, { limit: 15 }), 8000);
+      if (!rows.length) {
+        console.log(`  ${MINT}●${C.reset} Linked, but nothing stored yet.`);
+        console.log(`    ${C.dim}/remember <text> to add something.${C.reset}`);
+        return;
+      }
+      for (const r of rows) {
+        console.log(`  ${C.dim}${fit(r.category, 16).padEnd(16)}${C.reset}${C.bold}${fit(r.key, 22)}${C.reset}`);
+        for (const l of ui.wrap(String(r.value), ui.termWidth() - 8).slice(0, 2)) console.log(`      ${C.dim}${l}${C.reset}`);
+      }
+      console.log(`\n  ${MINT}●${C.reset} ${C.dim}${rows.length} strongest memories · shared with the Telegram bot${C.reset}`);
+    } catch (err) {
+      memoryProblem(err);
+    }
+  }
+
+  async function rememberText(text) {
+    if (!text) {
+      console.log(`  ${C.dim}Usage: /remember <something worth keeping>${C.reset}`);
+      return;
+    }
+    const key = text.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 40) || "note";
+    try {
+      const r = await withTimeout(memory.saveMemory(cfg, { category: "fact", key, value: text }), 8000);
+      console.log(`  ${MINT}✓${C.reset} ${r.action === "reinforced" ? "Reinforced" : "Remembered"} ${C.dim}fact/${key}${C.reset}`);
+    } catch (err) {
+      memoryProblem(err);
+    }
+  }
+
   async function compactSession(idArg) {
     const target = idArg ? loadSession(projectDir, idArg) : latestSession(projectDir);
     if (!target || !target.history) {
@@ -339,8 +420,8 @@ async function main() {
       sectionHeader("Models");
       for (const m of models) {
         const current = m.key === model ? `  ${MINT}● current${C.reset}` : "";
-        const tier = m.tier === "paid" ? `${AMBER}paid${C.reset}` : `${C.dim}free${C.reset}`;
-        console.log(`  ${C.bold}${m.key.padEnd(14)}${C.reset}${tier.padEnd(6)}  ${C.dim}${m.label}${C.reset}${current}`);
+        const tier = `${m.tier === "paid" ? AMBER : C.dim}${(m.tier === "paid" ? "paid" : "free").padEnd(5)}${C.reset}`;
+        console.log(`  ${C.bold}${m.key.padEnd(14)}${C.reset}${tier} ${C.dim}${fit(m.label, ui.termWidth() - 26)}${C.reset}${current}`);
       }
       console.log(`\n  ${C.dim}/model <key> to pin · /model auto for the free fallback chain${C.reset}`);
       return;
@@ -409,6 +490,14 @@ async function main() {
     }
     if (line === "/status") {
       await printStatus();
+      continue;
+    }
+    if (line === "/memory") {
+      await showMemory();
+      continue;
+    }
+    if (line.startsWith("/remember")) {
+      await rememberText(line.slice(9).trim());
       continue;
     }
     if (line.startsWith("/compact")) {
